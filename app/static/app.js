@@ -28,6 +28,9 @@ async function init(){
  }catch(e){alert(e.message);location.href="/"}
 }
 async function render(s){
+ // Concurrent bid responses can arrive out of order. Never let an older
+ // committed room version overwrite a newer snapshot already rendered.
+ if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
  state=s;lastSnapshot=s;
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}

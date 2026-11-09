@@ -50,7 +50,9 @@ class CreateRoom(BaseModel):
     players: list[dict] | None = None
 
 class BidRequest(BaseModel):
-    amount: int
+    # Legacy clients may still send the displayed amount; the server treats
+    # the request as a bid intent and calculates the authoritative amount.
+    amount: int | None = None
 
 class PlayerEdit(BaseModel):
     name: str | None = None
@@ -330,32 +332,44 @@ async def start_auction(code: str, authorization: str | None = Header(default=No
     await broadcast_snapshot(code)
     return result
 
-def _process_bid(code: str, authorization: str | None, amount: int):
+def _process_bid(code: str, authorization: str | None, _client_amount: int | None = None):
     started = time.perf_counter()
     with SessionLocal() as db:
         room, franchise, is_host = auth_context(db, code, authorization)
-        if is_host:
-            franchise = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
-            if not franchise:
-                raise HTTPException(403, "Select your franchise in Host controls before bidding.")
-        auth_done = time.perf_counter()
-        try:
-            place_bid(db, room, franchise, amount)
-            place_done = time.perf_counter()
-            db.commit()  # A bid is acknowledged only after its durable commit.
-            commit_done = time.perf_counter()
-            result = snapshot(db, room)
-            snapshot_done = time.perf_counter()
-            logger.info(
-                "bid_timing room=%s auth_ms=%.1f validation_write_ms=%.1f commit_ms=%.1f snapshot_ms=%.1f total_ms=%.1f",
-                code, (auth_done-started)*1000, (place_done-auth_done)*1000,
-                (commit_done-place_done)*1000, (snapshot_done-commit_done)*1000,
-                (snapshot_done-started)*1000
-            )
-            return result
-        except ValueError as e:
-            db.rollback()
-            raise HTTPException(status_code=400, detail=str(e))
+        # Serialize the entire read -> calculate -> write -> commit sequence.
+        # Previously place_bid released its lock before db.commit(), allowing
+        # another request to validate against stale state.
+        with lock_for(room.id):
+            db.refresh(room)
+            if is_host:
+                franchise = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
+                if not franchise:
+                    raise HTTPException(403, "Select your franchise in Host controls before bidding.")
+            if franchise is not None:
+                db.refresh(franchise)
+            auth_done = time.perf_counter()
+            try:
+                # A click means "place the next valid bid". The server derives
+                # the amount from the latest committed state, not stale UI state.
+                place_bid(db, room, franchise, None)
+                place_done = time.perf_counter()
+                db.commit()  # A bid is acknowledged only after its durable commit.
+                commit_done = time.perf_counter()
+            except ValueError as e:
+                db.rollback()
+                logger.warning("bid_rejected room=%s reason=%s", code, str(e))
+                raise HTTPException(status_code=400, detail=str(e))
+        # The bid is durable; don't hold up the next bidder while building a
+        # full room snapshot for this response.
+        result = snapshot(db, room)
+        snapshot_done = time.perf_counter()
+        logger.info(
+            "bid_timing room=%s auth_ms=%.1f validation_write_ms=%.1f commit_ms=%.1f snapshot_ms=%.1f total_ms=%.1f",
+            code, (auth_done-started)*1000, (place_done-auth_done)*1000,
+            (commit_done-place_done)*1000, (snapshot_done-commit_done)*1000,
+            (snapshot_done-started)*1000
+        )
+        return result
 
 @app.post("/api/rooms/{code}/bid")
 async def bid(code: str, payload: BidRequest, authorization: str | None = Header(default=None)):

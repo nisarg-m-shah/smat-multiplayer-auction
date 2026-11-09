@@ -143,9 +143,11 @@ def settle_lot(db: Session, room: Room):
     db.flush()
     return True
 
-def place_bid(db: Session, room: Room, franchise: Franchise, amount: int):
+def place_bid(db: Session, room: Room, franchise: Franchise, amount: int | None = None):
     with lock_for(room.id):
         db.refresh(room)
+        if franchise is not None:
+            db.refresh(franchise)
         lot = current_lot(db, room)
         if room.status != "LIVE" or not lot or lot.status != "LIVE":
             raise ValueError("Bidding is not currently open")
@@ -157,8 +159,9 @@ def place_bid(db: Session, room: Room, franchise: Franchise, amount: int):
         if lot.highest_franchise_id == franchise.id:
             raise ValueError("Your franchise is already the highest bidder")
         expected = next_bid_amount(lot)
-        if amount != expected:
-            raise ValueError(f"Invalid bid. The next valid bid is {expected}")
+        # Treat the API request as bid intent. Never trust a stale amount
+        # calculated by a browser that may be behind the latest accepted bid.
+        amount = expected
         # After winning this player, reserve only for the remaining required squad slots.
         slots_after_this_purchase = max(0, room.min_squad - sold_count(db, franchise.id) - 1)
         reserve = slots_after_this_purchase * 10
