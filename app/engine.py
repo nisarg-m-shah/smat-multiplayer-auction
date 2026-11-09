@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from threading import RLock
+from threading import RLock, Lock
 from sqlalchemy import select, desc, func
 from sqlalchemy.orm import Session
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
@@ -8,11 +8,17 @@ from .seed import weighted_random_order
 # One-process lock is a useful guard for this 10-person application.
 # Database transactions remain the persistent source of truth.
 _room_locks: dict[int, RLock] = {}
+_room_locks_guard = Lock()
 
 def lock_for(room_id: int):
-    if room_id not in _room_locks:
-        _room_locks[room_id] = RLock()
-    return _room_locks[room_id]
+    # Protect first-use creation too: two simultaneous first requests must not
+    # accidentally receive two different locks for the same room.
+    with _room_locks_guard:
+        lock = _room_locks.get(room_id)
+        if lock is None:
+            lock = RLock()
+            _room_locks[room_id] = lock
+        return lock
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -143,6 +149,13 @@ def settle_lot(db: Session, room: Room):
     db.flush()
     return True
 
+class BidRejected(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def place_bid(db: Session, room: Room, franchise: Franchise, amount: int | None = None):
     with lock_for(room.id):
         db.refresh(room)
@@ -150,25 +163,26 @@ def place_bid(db: Session, room: Room, franchise: Franchise, amount: int | None 
             db.refresh(franchise)
         lot = current_lot(db, room)
         if room.status != "LIVE" or not lot or lot.status != "LIVE":
-            raise ValueError("Bidding is not currently open")
+            raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
         if not lot.ends_at or seconds_until(lot.ends_at) <= 0:
-            settle_lot(db, room)
-            raise ValueError("The bidding timer has expired")
+            raise BidRejected("BID_WINDOW_EXPIRED", "The bidding timer has expired")
         if sold_count(db, franchise.id) >= room.max_squad:
-            raise ValueError("Your squad is already full")
+            raise BidRejected("SQUAD_FULL", "Your squad is already full")
         if lot.highest_franchise_id == franchise.id:
-            raise ValueError("Your franchise is already the highest bidder")
+            raise BidRejected("ALREADY_HIGHEST_BIDDER", "Your franchise is already the highest bidder")
         expected = next_bid_amount(lot)
-        # Treat the API request as bid intent. Never trust a stale amount
-        # calculated by a browser that may be behind the latest accepted bid.
-        amount = expected
+        # A bid is the exact amount the participant consciously selected.
+        # Never silently turn a stale click into a higher bid.
+        if amount is None or int(amount) != expected:
+            raise BidRejected("STALE_BID", f"This bid is outdated. The next required bid is {expected}.")
+        amount = int(amount)
         # After winning this player, reserve only for the remaining required squad slots.
         slots_after_this_purchase = max(0, room.min_squad - sold_count(db, franchise.id) - 1)
         reserve = slots_after_this_purchase * 10
         if franchise.purse_remaining - amount < reserve:
-            raise ValueError("This bid would leave insufficient purse to complete your minimum squad")
+            raise BidRejected("INSUFFICIENT_RESERVE", "This bid would leave insufficient purse to complete your minimum squad")
         if franchise.purse_remaining < amount:
-            raise ValueError("Insufficient remaining purse")
+            raise BidRejected("INSUFFICIENT_PURSE", "Insufficient remaining purse")
         # A new bid after an undo creates a new branch; discard the old redo path.
         db.query(Bid).filter(Bid.lot_id == lot.id, Bid.redo_available == True).update(
             {Bid.redo_available: False}, synchronize_session=False

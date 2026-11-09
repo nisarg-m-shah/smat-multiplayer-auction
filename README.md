@@ -117,7 +117,7 @@ APP_SECRET=use-a-long-random-secret
 AUCTION_SOURCE=./data/Auction.py
 ```
 
-Run one backend instance for v1. The in-process room lock is designed for one instance; do not horizontally scale this version without replacing it with a database/advisory-lock strategy.
+Run one backend instance and one Uvicorn worker for v1. The in-process room lock serializes bids and timer/host mutations only within that process; do not horizontally scale this version without replacing it with a database/advisory-lock strategy.
 
 For Render, use a persistent paid instance if uninterrupted uptime is essential. A free instance can sleep or restart. The database deadline is persisted, so the app can recover the current lot after a restart, but a restart can still interrupt the user experience while it wakes up.
 
@@ -182,7 +182,7 @@ When the host ends the auction, any currently active player is first settled at 
 
 ## 8. Hosted deployment for a 10-phone auction
 
-See [DEPLOYMENT.md](DEPLOYMENT.md). A Render Blueprint and `.python-version` are included. The hosted version uses managed PostgreSQL, one always-on web instance, and one Uvicorn worker. Do not scale to multiple instances/workers until the in-memory WebSocket manager, timer supervisor, and room locks are replaced with shared coordination.
+See [DEPLOYMENT.md](DEPLOYMENT.md). A Render Blueprint and `.python-version` are included. The hosted version uses managed PostgreSQL, one always-on web instance, and one Uvicorn worker. Do not scale to multiple instances/workers until the in-memory WebSocket manager, timer supervisor, and room locks are replaced with shared coordination. Bids are exact-amount instructions: stale amounts are rejected with HTTP 409 and are never auto-increased.
 
 
 ## Free hosting (10-phone test)
