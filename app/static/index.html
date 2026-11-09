@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMAT Auction Room</title><link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <header><div><div class="eyebrow">PRIVATE MULTIPLAYER AUCTION</div><h1>SMAT Auction Room</h1></div><div id="connection" class="pill">Not connected</div></header>
+  <main>
+    <section id="landing" class="panel">
+      <h2>Create a private auction</h2>
+      <p class="muted">The host creates the room and shares one private invite link with each franchise.</p>
+      <form id="create-form">
+        <label>Auction name<input name="name" value="SMAT Auction" required></label>
+        <label>Franchise names <textarea name="franchises" rows="4" placeholder="One franchise per line&#10;Mumbai Mavericks&#10;Coastal Kings" required></textarea></label>
+        <div class="grid two">
+          <label>Starting purse<input name="purse" type="number" value="5000" min="100"></label>
+          <label>Timer<select name="timer_seconds"><option>5</option><option selected>10</option><option>25</option></select></label>
+          <label>Minimum squad<input name="min_squad" type="number" value="18" min="1"></label>
+          <label>Maximum squad<input name="max_squad" type="number" value="25" min="1"></label>
+        </div>
+        <label class="check"><input type="checkbox" name="bid_extension" checked> Extend timer when a bid arrives</label>
+        <button class="primary">Create room</button>
+      </form>
+      <div class="note">Player data is loaded from <code>Auction.py</code> if the file is placed in the configured data folder. Otherwise, you can import a CSV in the pool manager.</div>
+    </section>
+    <section id="room" class="hidden">
+      <div class="roombar panel"><div><span class="eyebrow">ROOM</span><strong id="room-code"></strong><span id="role-label" class="muted"></span></div><button id="copy-link" class="secondary">Copy invite link</button></div>
+      <div id="invite-list" class="panel hidden"></div>
+      <div id="host-setup" class="panel hidden">
+        <div class="section-head"><div><h2>Auction pool management</h2><p class="muted">Remove players who should not be available. Higher importance weight means a better chance of appearing earlier.</p></div><button id="start-auction" class="primary">Lock pool & start</button></div>
+        <div class="host-franchise-picker"><label>My franchise (host participation)<select id="host-franchise-setup"><option value="">Host only — not bidding</option></select></label><p class="muted">Choose the franchise you will manage and bid for. This choice locks when the auction starts.</p></div>
+        <div class="toolbar"><input id="pool-search" placeholder="Search player, state team or role"><label class="upload">Import CSV<input id="csv-upload" type="file" accept=".csv"></label></div>
+        <div id="pool-table" class="table-wrap"></div>
+        <details><summary>Add a player manually</summary><form id="add-player" class="inline-form"><input name="name" placeholder="Player name" required><input name="state_team" placeholder="State team"><select name="role"><option>BAT</option><option>AR</option><option>BOWL</option><option>WK</option><option>UNKNOWN</option></select><input name="base_price" type="number" value="20"><input name="importance_weight" type="number" min="0.01" step="0.1" value="1"><button class="secondary">Add</button></form></details>
+      </div>
+      <div id="live-area" class="hidden">
+        <section class="auction-grid">
+          <div class="panel player-panel">
+            <div class="eyebrow" id="round-label">ROUND 1</div><div id="player-role" class="tag">PLAYER</div>
+            <h2 id="player-name">Waiting for player</h2><p id="player-team" class="muted"></p>
+            <div class="price-row"><div><span class="muted">BASE PRICE</span><strong id="base-price">—</strong></div><div><span class="muted">CURRENT BID</span><strong id="current-bid">—</strong></div></div>
+            <div class="timer" id="timer">—</div><div id="leading" class="leading">No bids yet</div>
+            <button id="bid-button" class="primary bid-button">Bid <span id="next-bid">—</span></button>
+            <p id="bid-feedback" class="muted"></p>
+          </div>
+          <div class="panel">
+            <div class="section-head"><h2>Franchises</h2><span class="muted">Live purse & squad</span></div><div id="franchises" class="franchise-grid"></div>
+          </div>
+        </section>
+        <section class="lower-grid">
+          <div class="panel"><h2>Recent activity</h2><div id="activity"></div></div>
+          <div class="panel"><h2>Your squad</h2><div id="my-squad" class="muted">Select a franchise invite to view its squad.</div></div>
+        </section>
+        <section id="admin-controls" class="panel hidden"><div class="section-head"><h2>Host controls</h2><span class="muted">Host can also manage a franchise</span></div>
+          <div class="host-franchise-picker"><label>My franchise<select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
+          <div class="button-row"><button data-action="pause" class="secondary">Pause</button><button data-action="resume" class="secondary">Resume</button><button data-action="undo-bid" class="secondary">Undo last bid</button><button data-action="redo-bid" class="secondary">Redo last bid</button><button data-action="undo-sale" class="danger">Undo last player</button><button data-action="redo-sale" class="secondary">Redo last player</button><button data-action="finish" class="danger">End auction</button></div>
+          <div class="nomination"><h3>Unsold-only round</h3><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players & start unsold-only round</button></div>
+        </section>
+      </div>
+      <section id="final-results" class="hidden">
+        <div class="final-hero panel"><div class="eyebrow">SMAT AUCTION</div><h2>AUCTION COMPLETED</h2><p class="muted">The auction has officially ended. Here is the final franchise-wise squad breakdown.</p></div>
+        <div id="final-summary" class="final-summary-grid"></div>
+        <div id="final-franchises" class="final-franchise-grid"></div>
+      </section>
+    </section>
+    <section id="invite-output" class="panel hidden"></section>
+  </main>
+  <div id="celebration" class="celebration hidden" aria-live="polite"><div class="celebration-card"><div id="celebration-title"></div><div id="celebration-detail"></div></div><div id="confetti-layer"></div></div>
+  <footer>Private room · Server-controlled bidding · No real-money transactions</footer>
+</div>
+<script src="/static/app.js"></script>
+</body></html>
