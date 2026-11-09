@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from threading import RLock
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from sqlalchemy.orm import Session
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .seed import weighted_random_order
@@ -63,9 +63,10 @@ def squad_count(db: Session, franchise_id: int):
     ).with_only_columns(Sale.id))  # replaced by count below
 
 def sold_count(db: Session, franchise_id: int):
-    return len(db.scalars(select(Sale).where(
+    # COUNT in PostgreSQL instead of transferring every sale row to Python.
+    return db.scalar(select(func.count(Sale.id)).where(
         Sale.franchise_id == franchise_id, Sale.reversed == False
-    )).all())
+    )) or 0
 
 def purse_reserve(db: Session, room: Room, franchise: Franchise):
     remaining_slots = max(0, room.min_squad - sold_count(db, franchise.id))
@@ -431,7 +432,15 @@ def snapshot(db: Session, room: Room):
     bids = []
     live = current_lot(db, room)
     if live:
-        bids = db.scalars(select(Bid).where(Bid.lot_id == live.id, Bid.active == True).order_by(Bid.sequence_no)).all()
+        # Fetch active and redoable bids in one round trip; derive history flags below.
+        bids = db.scalars(select(Bid).where(
+            Bid.lot_id == live.id,
+            (Bid.active == True) | (Bid.redo_available == True)
+        ).order_by(Bid.sequence_no)).all()
+    active_bids = [b for b in bids if b.active]
+    redoable_bid = any((not b.active) and b.redo_available for b in bids)
+    undoable_sale = any(l.status in ("SOLD", "UNSOLD") and l.settled_at is not None for l in lots)
+    redoable_sale = any(l.settlement_redo_available and l.status in ("QUEUED", "LIVE", "PAUSED") for l in lots)
     sale_by_franchise = {}
     for s in sales:
         sale_by_franchise.setdefault(s.franchise_id, []).append({
@@ -477,11 +486,11 @@ def snapshot(db: Session, room: Room):
         "events": [{"id": e.id, "kind": e.kind, "message": e.message,
                     "data": e.data or {}, "created_at": e.created_at.isoformat()} for e in events],
         "recent_bids": [{"franchise": next((f.name for f in franchises if f.id == b.franchise_id), "?"),
-                         "amount": b.amount, "sequence": b.sequence_no} for b in bids],
+                         "amount": b.amount, "sequence": b.sequence_no} for b in active_bids],
         "history": {
-            "can_undo_bid": bool(live and bids and room.status == "LIVE"),
-            "can_redo_bid": bool(live and room.status == "LIVE" and db.scalar(select(Bid.id).where(Bid.room_id == room.id, Bid.lot_id == live.id, Bid.active == False, Bid.redo_available == True).limit(1))),
-            "can_undo_sale": bool(room.status != "COMPLETED" and db.scalar(select(Lot.id).where(Lot.room_id == room.id, Lot.status.in_(["SOLD", "UNSOLD"]), Lot.settled_at.is_not(None)).limit(1))),
-            "can_redo_sale": bool(room.status != "COMPLETED" and db.scalar(select(Lot.id).where(Lot.room_id == room.id, Lot.settlement_redo_available == True, Lot.status.in_(["QUEUED", "LIVE", "PAUSED"])).limit(1)))
+            "can_undo_bid": bool(live and active_bids and room.status == "LIVE"),
+            "can_redo_bid": bool(live and room.status == "LIVE" and redoable_bid),
+            "can_undo_sale": bool(room.status != "COMPLETED" and undoable_sale),
+            "can_redo_sale": bool(room.status != "COMPLETED" and redoable_sale)
         }
     }

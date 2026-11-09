@@ -233,7 +233,16 @@ $("create-form").addEventListener("submit",async e=>{
  }catch(err){alert(err.message)}
 });
 $("copy-link").onclick=()=>navigator.clipboard.writeText(location.href);
-$("bid-button").onclick=async()=>{if(!state?.current_player)return;try{const d=await api(`/api/rooms/${roomCode}/bid`,{method:"POST",body:JSON.stringify({amount:state.current_player.next_bid})});render(d);message("Bid accepted");}catch(e){message(e.message)}};
+$("bid-button").onclick=async()=>{
+ if(!state?.current_player||$("bid-button").disabled)return;
+ const button=$("bid-button");
+ const amount=state.current_player.next_bid;
+ button.disabled=true;message("Submitting bid…");
+ try{
+  const d=await api(`/api/rooms/${roomCode}/bid`,{method:"POST",body:JSON.stringify({amount})});
+  await render(d);message("Bid accepted");
+ }catch(e){message(e.message);button.disabled=!(state?.room?.status==="LIVE"&&myFranchise)}
+};
 $("start-auction").onclick=async()=>{if(!confirm("Lock the player pool and start the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/start`,{method:"POST"});render(d);show("live-area");hide("host-setup");}catch(e){alert(e.message)}};
 document.querySelectorAll("[data-action]").forEach(b=>b.onclick=async()=>{const action=b.dataset.action;if(action==="finish"&&!confirm("End the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/host/${action}`,{method:"POST"});render(d)}catch(e){alert(e.message)}});
 async function loadPool(){pool=await api(`/api/rooms/${roomCode}/pool`);renderPool()}

@@ -1,4 +1,4 @@
-import asyncio, secrets, string, os
+import asyncio, secrets, string, os, logging, time
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -14,7 +14,7 @@ from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD
 from .seed import load_players, load_players_csv
 from .engine import (get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
-                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc, recover_interrupted_rooms)
+                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc, recover_interrupted_rooms, lock_for)
 
 Base.metadata.create_all(bind=engine)
 # Lightweight additive migration for rooms created before redo support.
@@ -32,6 +32,9 @@ with engine.begin() as conn:
     room_columns = {column["name"] for column in inspector.get_columns("rooms")}
     if "host_franchise_id" not in room_columns:
         conn.exec_driver_sql("ALTER TABLE rooms ADD COLUMN host_franchise_id INTEGER NULL")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("smat-auction")
+
 app = FastAPI(title="SMAT Private Auction", version="1.0.0")
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -70,14 +73,20 @@ class ConnectionManager:
     def disconnect(self, code, ws):
         self.connections.get(code, set()).discard(ws)
     async def broadcast(self, code, message):
-        dead = []
-        for ws in list(self.connections.get(code, set())):
+        # Send concurrently: one slow phone must not hold up every other bidder.
+        sockets = list(self.connections.get(code, set()))
+        if not sockets:
+            return
+        async def send(ws):
             try:
-                await ws.send_json(message)
+                await asyncio.wait_for(ws.send_json(message), timeout=2.0)
+                return None
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(code, ws)
+                return ws
+        results = await asyncio.gather(*(send(ws) for ws in sockets))
+        for ws in results:
+            if ws is not None:
+                self.disconnect(code, ws)
 
 manager = ConnectionManager()
 timer_tasks: dict[str, asyncio.Task] = {}
@@ -104,43 +113,62 @@ def require_host(db, code, authorization):
         raise HTTPException(403, "Host permission required")
     return room
 
-async def broadcast_snapshot(code):
+def _snapshot_for_room(code):
     with SessionLocal() as db:
-        try:
-            room = get_room(db, code)
-            data = snapshot(db, room)
-        except Exception:
-            return
+        room = get_room(db, code)
+        return snapshot(db, room)
+
+async def broadcast_snapshot(code):
+    try:
+        data = await asyncio.to_thread(_snapshot_for_room, code)
+    except Exception:
+        return
     await manager.broadcast(code, {"type": "snapshot", "data": data})
 
+def _read_timer_deadline(code):
+    with SessionLocal() as db:
+        room = get_room(db, code)
+        if room.status != "LIVE" or not room.current_lot_id:
+            return None
+        lot = db.get(Lot, room.current_lot_id)
+        if not lot or lot.status != "LIVE" or not lot.ends_at:
+            return None
+        return lot.ends_at
+
+def _settle_expired_lot(code):
+    with SessionLocal() as db:
+        room = get_room(db, code)
+        # Serialize expiry settlement with incoming bids for this room.
+        with lock_for(room.id):
+            db.refresh(room)
+            if room.status != "LIVE" or not room.current_lot_id:
+                return False, False
+            lot = db.get(Lot, room.current_lot_id)
+            if not lot or lot.status != "LIVE" or not lot.ends_at or seconds_until(lot.ends_at) > 0:
+                return False, room.status == "LIVE"
+            settle_lot(db, room)
+            open_next_lot(db, room)
+            db.commit()
+            return True, room.status == "LIVE"
+
 async def timer_supervisor(code):
-    """One task per room. Database deadline is authoritative and survives restart."""
+    """Sleep to the persisted deadline; never poll PostgreSQL several times per second."""
     try:
-        while True:
-            await asyncio.sleep(0.25)
-            with SessionLocal() as db:
-                try:
-                    room = get_room(db, code)
-                    if room.status != "LIVE" or not room.current_lot_id:
-                        return
-                    lot = db.get(Lot, room.current_lot_id)
-                    if not lot or lot.status != "LIVE" or not lot.ends_at:
-                        return
-                    if seconds_until(lot.ends_at) <= 0:
-                        settle_lot(db, room)
-                        # Automatically put the next queued player on screen.
-                        open_next_lot(db, room)
-                        db.commit()
-                        await broadcast_snapshot(code)
-                        if room.status != "LIVE":
-                            return
-                        continue
-                    wait = max(0.05, min(0.5, seconds_until(lot.ends_at)))
-                except Exception:
-                    db.rollback()
-                    return
-            await asyncio.sleep(wait)
+        deadline = await asyncio.to_thread(_read_timer_deadline, code)
+        if deadline is None:
+            return
+        delay = max(0.0, seconds_until(deadline))
+        await asyncio.sleep(delay)
+        settled, still_live = await asyncio.to_thread(_settle_expired_lot, code)
+        if settled:
+            await broadcast_snapshot(code)
+        if still_live:
+            arm_timer(code)
     except asyncio.CancelledError:
+        return
+    except Exception:
+        # Keep the durable state untouched if the database is temporarily unavailable.
+        # The host can resume/retry; no in-memory-only settlement is attempted.
         return
 
 def arm_timer(code):
@@ -302,23 +330,40 @@ async def start_auction(code: str, authorization: str | None = Header(default=No
     await broadcast_snapshot(code)
     return result
 
+def _process_bid(code: str, authorization: str | None, amount: int):
+    started = time.perf_counter()
+    with SessionLocal() as db:
+        room, franchise, is_host = auth_context(db, code, authorization)
+        if is_host:
+            franchise = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
+            if not franchise:
+                raise HTTPException(403, "Select your franchise in Host controls before bidding.")
+        auth_done = time.perf_counter()
+        try:
+            place_bid(db, room, franchise, amount)
+            place_done = time.perf_counter()
+            db.commit()  # A bid is acknowledged only after its durable commit.
+            commit_done = time.perf_counter()
+            result = snapshot(db, room)
+            snapshot_done = time.perf_counter()
+            logger.info(
+                "bid_timing room=%s auth_ms=%.1f validation_write_ms=%.1f commit_ms=%.1f snapshot_ms=%.1f total_ms=%.1f",
+                code, (auth_done-started)*1000, (place_done-auth_done)*1000,
+                (commit_done-place_done)*1000, (snapshot_done-commit_done)*1000,
+                (snapshot_done-started)*1000
+            )
+            return result
+        except ValueError as e:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/api/rooms/{code}/bid")
-async def bid(code: str, payload: BidRequest, authorization: str | None = Header(default=None),
-        db: Session = Depends(get_db)):
-    room, franchise, is_host = auth_context(db, code, authorization)
-    if is_host:
-        franchise = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
-        if not franchise:
-            raise HTTPException(403, "Select your franchise in Host controls before bidding.")
-    try:
-        place_bid(db, room, franchise, payload.amount)
-        db.commit()
-    except ValueError as e:
-        db.rollback()
-        fail(e)
+async def bid(code: str, payload: BidRequest, authorization: str | None = Header(default=None)):
+    # SQLAlchemy uses a synchronous psycopg connection. Run the whole transaction
+    # off the event loop so it cannot stall WebSockets, timers, or other bidders.
+    result = await asyncio.to_thread(_process_bid, code, authorization, payload.amount)
     arm_timer(code)
-    result = snapshot(db, room)
-    await broadcast_snapshot(code)
+    asyncio.create_task(manager.broadcast(code, {"type": "snapshot", "data": result}))
     return result
 
 @app.post("/api/rooms/{code}/host/select-franchise")
@@ -338,60 +383,62 @@ async def select_host_franchise(code: str, payload: dict,
     await broadcast_snapshot(code)
     return result
 
+def _process_host_action(code: str, action: str, authorization: str | None):
+    with SessionLocal() as db:
+        room = require_host(db, code, authorization)
+        try:
+            if action == "pause":
+                pause_room(db, room)
+            elif action == "resume":
+                resume_room(db, room)
+            elif action == "advance":
+                if room.status == "LIVE":
+                    lot = db.get(Lot, room.current_lot_id)
+                    if lot:
+                        lot.ends_at = now_utc()
+                        settle_lot(db, room)
+                open_next_lot(db, room)
+            elif action == "undo-sale":
+                undo_last_sale(db, room)
+                if room.status not in ("LIVE", "PAUSED", "COMPLETED"):
+                    open_next_lot(db, room)
+            elif action == "undo-bid":
+                undo_last_bid(db, room)
+            elif action == "redo-bid":
+                redo_last_bid(db, room)
+            elif action == "redo-sale":
+                redo_last_sale(db, room)
+                if room.current_lot_id is None and room.status not in ("LIVE", "PAUSED", "COMPLETED"):
+                    open_next_lot(db, room)
+            elif action == "finish":
+                if room.current_lot_id:
+                    active_lot = db.get(Lot, room.current_lot_id)
+                    if active_lot and active_lot.status in ("LIVE", "PAUSED"):
+                        active_lot.status = "LIVE"
+                        active_lot.ends_at = now_utc()
+                        settle_lot(db, room)
+                room.status = "COMPLETED"
+                room.current_lot_id = None
+                event(db, room.id, "COMPLETED", "Auction marked complete.")
+            else:
+                raise ValueError("Unknown host action")
+            room.version += 1
+            db.commit()
+            return snapshot(db, room)
+        except ValueError as e:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/api/rooms/{code}/host/{action}")
-async def host_action(code: str, action: str, authorization: str | None = Header(default=None),
-                db: Session = Depends(get_db)):
-    room = require_host(db, code, authorization)
-    try:
-        if action == "pause":
-            pause_room(db, room)
-        elif action == "resume":
-            resume_room(db, room)
-        elif action == "advance":
-            host_advance_result = None
-            if room.status == "LIVE":
-                lot = db.get(Lot, room.current_lot_id)
-                if lot:
-                    lot.ends_at = now_utc()
-                    settle_lot(db, room)
-            host_advance_result = open_next_lot(db, room)
-        elif action == "undo-sale":
-            undo_last_sale(db, room)
-            if room.status not in ("LIVE", "PAUSED") and room.status != "COMPLETED":
-                open_next_lot(db, room)
-        elif action == "undo-bid":
-            undo_last_bid(db, room)
-        elif action == "redo-bid":
-            redo_last_bid(db, room)
-        elif action == "redo-sale":
-            redo_last_sale(db, room)
-            if room.current_lot_id is None and room.status not in ("LIVE", "PAUSED", "COMPLETED"):
-                open_next_lot(db, room)
-        elif action == "finish":
-            # Do not silently drop a player if the host ends the auction mid-lot.
-            if room.current_lot_id:
-                active_lot = db.get(Lot, room.current_lot_id)
-                if active_lot and active_lot.status in ("LIVE", "PAUSED"):
-                    active_lot.status = "LIVE"
-                    active_lot.ends_at = now_utc()
-                    settle_lot(db, room)
-            room.status = "COMPLETED"
-            room.current_lot_id = None
-            event(db, room.id, "COMPLETED", "Auction marked complete.")
-        else:
-            raise ValueError("Unknown host action")
-        room.version += 1
-        db.commit()
-    except ValueError as e:
-        db.rollback()
-        fail(e)
+async def host_action(code: str, action: str, authorization: str | None = Header(default=None)):
+    result = await asyncio.to_thread(_process_host_action, code, action, authorization)
     if action in ("resume", "advance", "undo-bid", "redo-bid", "undo-sale", "redo-sale"):
         arm_timer(code)
     elif action in ("pause", "finish"):
         task = timer_tasks.get(code)
-        if task: task.cancel()
-    result = snapshot(db, room)
-    await broadcast_snapshot(code)
+        if task:
+            task.cancel()
+    asyncio.create_task(manager.broadcast(code, {"type": "snapshot", "data": result}))
     return result
 
 @app.post("/api/rooms/{code}/nominate-unsold")
