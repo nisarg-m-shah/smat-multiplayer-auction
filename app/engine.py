@@ -391,6 +391,35 @@ def nominated_unsold(db: Session, room: Room, player_ids: list[int], price_overr
     db.flush()
     open_next_lot(db, room)
 
+
+def recover_interrupted_rooms(db: Session):
+    """Pause live rooms after restart without changing accepted bids or sales."""
+    rooms = db.scalars(select(Room).where(Room.status == "LIVE")).all()
+    recovered = []
+    for room in rooms:
+        lot = current_lot(db, room)
+        if lot is not None and lot.status == "LIVE":
+            # The timer intentionally restarts at its configured full duration.
+            lot.status = "PAUSED"
+            lot.ends_at = None
+            lot.remaining_ms = room.timer_seconds * 1000
+            room.status = "PAUSED"
+            room.version += 1
+            event(db, room.id, "RECOVERED_PAUSED",
+                  "Server restarted. Auction state recovered and paused; resume starts a fresh timer.",
+                  {"lot_id": lot.id, "timer_seconds": room.timer_seconds,
+                   "current_bid": lot.current_bid,
+                   "highest_franchise_id": lot.highest_franchise_id})
+        else:
+            # Fail closed if the active lot cannot be verified.
+            room.status = "PAUSED"
+            room.version += 1
+            event(db, room.id, "RECOVERY_REVIEW_REQUIRED",
+                  "Server restarted; active lot needs host review before bidding can continue.")
+        recovered.append(room.code)
+    db.commit()
+    return recovered
+
 def snapshot(db: Session, room: Room):
     franchises = db.scalars(select(Franchise).where(
         Franchise.room_id == room.id

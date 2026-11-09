@@ -183,3 +183,13 @@ When the host ends the auction, any currently active player is first settled at 
 ## 8. Hosted deployment for a 10-phone auction
 
 See [DEPLOYMENT.md](DEPLOYMENT.md). A Render Blueprint and `.python-version` are included. The hosted version uses managed PostgreSQL, one always-on web instance, and one Uvicorn worker. Do not scale to multiple instances/workers until the in-memory WebSocket manager, timer supervisor, and room locks are replaced with shared coordination.
+
+
+## Free hosting (10-phone test)
+
+See `DEPLOYMENT.md` for the Render Free + Supabase Free setup. The free deployment uses Supabase Postgres because Render Free web services have ephemeral filesystems and Render Free Postgres expires after 30 days. Free hosting can restart or sleep; rehearse all 10 devices before the real auction.
+
+
+## Restart recovery
+
+Auction state is stored in PostgreSQL. If the server process restarts while a room is live, startup recovery marks that room and its current lot as paused without changing the current player, highest accepted bid, bid history, completed sales, franchise squads, or purse balances. The host must resume manually; the current lot then receives a fresh full timer. Accepted bid requests are committed to the database before the API acknowledges them. Test this with a real Render restart and Supabase database before the live auction.

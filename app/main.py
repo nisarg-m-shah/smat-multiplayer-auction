@@ -14,7 +14,7 @@ from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD
 from .seed import load_players, load_players_csv
 from .engine import (get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
-                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc)
+                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc, recover_interrupted_rooms)
 
 Base.metadata.create_all(bind=engine)
 # Lightweight additive migration for rooms created before redo support.
@@ -154,11 +154,10 @@ def arm_timer(code):
 
 @app.on_event("startup")
 async def recover_live_rooms():
+    # Do not restart a live timer automatically. Recover the durable auction
+    # state, pause the room, and let the host explicitly resume with a full timer.
     with SessionLocal() as db:
-        rooms = db.scalars(select(Room).where(Room.status == "LIVE")).all()
-        codes = [r.code for r in rooms]
-    for code in codes:
-        arm_timer(code)
+        recover_interrupted_rooms(db)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
