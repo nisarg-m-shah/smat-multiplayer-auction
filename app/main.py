@@ -160,24 +160,42 @@ def _settle_expired_lot(code):
             return True, room.status == "LIVE"
 
 async def timer_supervisor(code):
-    """Sleep to the persisted deadline; never poll PostgreSQL several times per second."""
-    try:
-        deadline = await asyncio.to_thread(_read_timer_deadline, code)
-        if deadline is None:
-            return
-        delay = max(0.0, seconds_until(deadline))
-        await asyncio.sleep(delay)
-        settled, still_live = await asyncio.to_thread(_settle_expired_lot, code)
-        if settled:
-            await broadcast_snapshot(code)
-        if still_live:
-            arm_timer(code)
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        # Keep the durable state untouched if the database is temporarily unavailable.
-        # The host can resume/retry; no in-memory-only settlement is attempted.
-        return
+    """Settle persisted deadlines, retry transient DB failures, and follow the next lot.
+
+    The database remains authoritative. If a bid extends the deadline while this
+    task sleeps, _settle_expired_lot re-reads the room under its lock and reports
+    that it is still live; this loop then reads the new deadline. A transient
+    database error is logged and retried with bounded backoff instead of silently
+    killing the room's timer permanently.
+    """
+    retry_delay = 1.0
+    while True:
+        try:
+            deadline = await asyncio.to_thread(_read_timer_deadline, code)
+            if deadline is None:
+                return
+
+            delay = max(0.0, seconds_until(deadline))
+            if delay:
+                await asyncio.sleep(delay)
+
+            settled, still_live = await asyncio.to_thread(_settle_expired_lot, code)
+            retry_delay = 1.0
+            if settled:
+                await broadcast_snapshot(code)
+            if not still_live:
+                return
+            # Either a bid extended the deadline while we slept, or another
+            # operation changed the current lot. Re-read the durable deadline.
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "timer_supervisor_error room=%s retry_in_seconds=%.1f",
+                code, retry_delay
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 10.0)
 
 def arm_timer(code):
     task = timer_tasks.get(code)

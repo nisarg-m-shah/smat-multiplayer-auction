@@ -6,9 +6,29 @@ const params=new URLSearchParams(location.search);
 roomCode=params.get("room"); token=params.get("token");
 const money=(n)=>Number(n||0).toLocaleString("en-IN");
 function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
-async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));if(!r.ok){const err=new Error(typeof d.detail==="string"?d.detail:(d.detail?.message||"Request failed"));err.status=r.status;err.detail=d.detail;throw err}return d}
+function displayMessage(value){
+ if(typeof value==="string")return value;
+ if(value&&typeof value==="object"){
+  if(typeof value.message==="string")return value.message;
+  if(typeof value.detail==="string")return value.detail;
+  if(typeof value.code==="string")return value.code.replaceAll("_"," ").toLowerCase();
+  try{return JSON.stringify(value)}catch(_){return "Request failed"}
+ }
+ return value==null?"Request failed":String(value);
+}
+async function api(path,opts={}){
+ const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});
+ const d=await r.json().catch(()=>({}));
+ if(!r.ok){
+  const detail=d.detail;
+  const err=new Error(displayMessage(detail)||"Request failed");
+  err.status=r.status;err.detail=detail;err.code=detail&&typeof detail==="object"?detail.code:null;
+  throw err;
+ }
+ return d;
+}
 function show(id){$(id).classList.remove("hidden")} function hide(id){$(id).classList.add("hidden")}
-function message(text){$("bid-feedback").textContent=text}
+function message(value){$("bid-feedback").textContent=displayMessage(value)}
 async function init(){
  if(!roomCode||!token){show("landing");hide("room");return}
  hide("landing");show("room");$("room-code").textContent=roomCode;
@@ -263,7 +283,7 @@ $("create-form").addEventListener("submit",async e=>{
   const d=await fetch("/api/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
    name:fd.get("name"),franchises,purse:Number(fd.get("purse")),timer_seconds:Number(fd.get("timer_seconds")),
    min_squad:Number(fd.get("min_squad")),max_squad:Number(fd.get("max_squad")),bid_extension:fd.get("bid_extension")==="on"
-  })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(x.detail);return x});
+  })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(displayMessage(x.detail));return x});
   const base=location.origin;let html=`<h2>Room created: ${d.room_code}</h2><p>Save these links now. The raw invite tokens are only shown once.</p><p><b>Host link:</b> <a href="${base}${d.host_url}&host=1">${base}${d.host_url}&host=1</a></p><h3>Franchise invites</h3>`;
   d.franchise_invites.forEach(x=>html+=`<p><b>${esc(x.franchise)}:</b> <a href="${base}${x.url}">${base}${x.url}</a></p>`);
   html+=`<p>Players loaded: ${d.players_loaded}. Copy the host link and franchise links somewhere safe.</p>`;
@@ -327,7 +347,7 @@ async function updateHostFranchise(value){
 }
 $("host-franchise-setup").onchange=e=>updateHostFranchise(e.target.value);
 $("add-player").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api(`/api/rooms/${roomCode}/players`,{method:"POST",body:JSON.stringify(Object.fromEntries(f))});e.target.reset();await loadPool()}catch(err){alert(err.message)}};
-$("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(d.detail);alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
+$("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(displayMessage(d.detail));alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
 function renderUnsold(list){$("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label><input type="checkbox" value="${p.player_id}"> ${esc(p.name)} (${esc(p.role)}) — base ${money(p.base_price)}</label><input class="small-input" type="number" min="1" data-unsold-price="${p.player_id}" placeholder="Keep ${p.base_price}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
 $("nominate").onclick=async()=>{
  const ids=[...$("unsold-list").querySelectorAll('input[type="checkbox"]:checked')].map(x=>Number(x.value));
