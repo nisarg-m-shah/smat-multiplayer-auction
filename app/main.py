@@ -1,12 +1,13 @@
-import asyncio, secrets, string, os, logging, time, uuid
-from datetime import datetime, timezone
+import asyncio, json, re, secrets, string, os, logging, time, uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select, inspect, text, and_
 from sqlalchemy.orm import Session
+from . import perf
 from .db import Base, engine, SessionLocal, get_db
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .security import new_token, token_hash
@@ -14,7 +15,9 @@ from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD
 from .seed import load_players, load_players_csv
 from .engine import (get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
-                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc, recover_interrupted_rooms, lock_for, BidRejected, next_bid_amount)
+                     undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc,
+                     recover_interrupted_rooms, lock_for,
+                     BidRejected, AuthError, load_bid_context, validate_bid, apply_bid, compact_state, iso_utc)
 
 Base.metadata.create_all(bind=engine)
 # Lightweight additive migration for rooms created before redo support.
@@ -50,9 +53,16 @@ class CreateRoom(BaseModel):
     players: list[dict] | None = None
 
 class BidRequest(BaseModel):
-    # The exact amount displayed when the participant clicked. Stale amounts
-    # are rejected; the server never silently increases a bid.
-    amount: int = Field(ge=1)
+    # EXACT-AMOUNT BIDDING: `amount` is the price the bidder saw and chose. The server
+    # never raises it; if it is not exactly the price required right now the bid is
+    # rejected with 409 STALE_BID. `lot_id`/`player_id` pin the bid to the player the
+    # bidder was looking at (a bid for player A can never land on player B).
+    # `franchise_id` is optional and only ever CHECKED against the franchise that the
+    # invite token controls; the token, not this field, decides who is bidding.
+    amount: int = Field(gt=0)
+    lot_id: int | None = None
+    player_id: int | None = None
+    franchise_id: int | None = None
 
 class PlayerEdit(BaseModel):
     name: str | None = None
@@ -66,40 +76,167 @@ class NominationRequest(BaseModel):
     player_ids: list[int]
     price_overrides: dict[str, int] = {}
 
+SEND_TIMEOUT = 5.0      # seconds a single socket write may take before that client is dropped
+SEND_QUEUE_MAX = 256    # per-client backlog; a client this far behind is dropped and recovers via snapshot
+
+
+class FanoutTracker:
+    """Measures commit -> socket-write time for one broadcast (server-side, excludes network)."""
+    def __init__(self, code, version, t_commit, recipients):
+        self.code, self.version, self.t_commit, self.n = code, version, t_commit, recipients
+        self.done = 0; self.ok = 0; self.lat = []
+
+    def record(self, ok):
+        self.done += 1
+        self.ok += 1 if ok else 0
+        self.lat.append((time.perf_counter() - self.t_commit) * 1000)
+        if self.done >= self.n:
+            logger.info("bid_broadcast room=%s version=%s recipients=%d ok=%d failed=%d max_ms=%.1f avg_ms=%.1f",
+                        self.code, self.version, self.n, self.ok, self.n - self.ok,
+                        max(self.lat), sum(self.lat) / len(self.lat))
+
+
+class Connection:
+    """One WebSocket with its own outbound queue + writer task, so a slow or dead
+    client can only ever delay itself, and messages to it keep their commit order."""
+    def __init__(self, ws):
+        self.ws = ws
+        self.queue = asyncio.Queue(maxsize=SEND_QUEUE_MAX)
+        self.task = None
+        self.closed = False
+
+    def send(self, text, tracker=None):
+        if self.closed:
+            return False
+        try:
+            self.queue.put_nowait((text, tracker))
+            return True
+        except asyncio.QueueFull:
+            return False
+
+
 class ConnectionManager:
     def __init__(self):
-        self.connections: dict[str, set[WebSocket]] = {}
+        self.connections: dict[str, set[Connection]] = {}
+
     async def connect(self, code, ws):
         await ws.accept()
-        self.connections.setdefault(code, set()).add(ws)
-    def disconnect(self, code, ws):
-        self.connections.get(code, set()).discard(ws)
-    async def broadcast(self, code, message):
-        # Send concurrently: one slow phone must not hold up every other bidder.
-        sockets = list(self.connections.get(code, set()))
-        if not sockets:
-            return
-        async def send(ws):
+        conn = Connection(ws)
+        conn.task = asyncio.create_task(self._writer(code, conn))
+        self.connections.setdefault(code.upper(), set()).add(conn)
+        return conn
+
+    def disconnect(self, code, conn):
+        self._forget(code, conn)
+        if conn.task and not conn.task.done():
+            conn.task.cancel()
+
+    def _forget(self, code, conn):
+        conn.closed = True
+        self.connections.get(code.upper(), set()).discard(conn)
+
+    async def _writer(self, code, conn):
+        close_socket = False
+        try:
+            while True:
+                text, tracker = await conn.queue.get()
+                try:
+                    await asyncio.wait_for(conn.ws.send_text(text), timeout=SEND_TIMEOUT)
+                    ok = True
+                except Exception:
+                    ok = False
+                if tracker:
+                    tracker.record(ok)
+                if not ok:
+                    close_socket = True
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._forget(code, conn)
+            while not conn.queue.empty():           # anything still queued was not delivered
+                _, tracker = conn.queue.get_nowait()
+                if tracker:
+                    tracker.record(False)
+        if close_socket:
             try:
-                await asyncio.wait_for(ws.send_json(message), timeout=2.0)
-                return None
+                await conn.ws.close(code=1011)       # the client reconnects and recovers by snapshot
             except Exception:
-                return ws
-        results = await asyncio.gather(*(send(ws) for ws in sockets))
-        for ws in results:
-            if ws is not None:
-                self.disconnect(code, ws)
+                pass
+
+    def broadcast_nowait(self, code, message, t_commit=None):
+        """Queue `message` for every client in the room. Never blocks on any client.
+        Must run on the event-loop thread (publish() takes care of that)."""
+        conns = list(self.connections.get(code.upper(), ()))
+        if not conns:
+            return
+        text = json.dumps(message, separators=(",", ":"))   # serialise once, not per client
+        tracker = None
+        if message.get("type") == "BID_ACCEPTED" and t_commit is not None:
+            tracker = FanoutTracker(code, message.get("room_version"), t_commit, len(conns))
+        for conn in conns:
+            if not conn.send(text, tracker):
+                if tracker:
+                    tracker.record(False)
+                self.disconnect(code, conn)
+                asyncio.ensure_future(self._close_quietly(conn.ws))
+
+    async def _close_quietly(self, ws):
+        try:
+            await ws.close(code=1013)
+        except Exception:
+            pass
+
+    async def broadcast(self, code, message):
+        self.broadcast_nowait(code, message)
 
 manager = ConnectionManager()
 timer_tasks: dict[str, asyncio.Task] = {}
+_loop: asyncio.AbstractEventLoop | None = None
+
+def _ensure_loop():
+    global _loop
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+def publish(code, message):
+    """Thread-safe: hand `message` to the event loop for fan-out to the room's WebSockets.
+
+    Called from the worker thread that just committed, while it still holds the room lock,
+    so messages are queued in exactly the order the database committed them. This call only
+    schedules work; it cannot block, and a failure here can never undo a committed change."""
+    loop = _loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(manager.broadcast_nowait, code, message, time.perf_counter())
+    except Exception:
+        logger.warning("publish failed room=%s", code)
 
 def fail(exc):
     raise HTTPException(status_code=400, detail=str(exc))
 
-def auth_context(db: Session, code: str, authorization: str | None):
+# (room code, token hash) pairs whose credential has been verified against the database.
+# Used ONLY to decide whether a bid request may take the room lock without a separate
+# pre-check query. Every bid still re-verifies its credential inside the single
+# authenticate-and-read query (engine.load_bid_context), so this never grants access.
+_verified: set[tuple[str, str]] = set()
+
+def _remember(code, hashed):
+    if len(_verified) > 2048:
+        _verified.clear()
+    _verified.add((code.upper(), hashed))
+
+def _bearer_hash(authorization: str | None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing invite token")
-    hashed = token_hash(authorization.split(" ", 1)[1].strip())
+    return token_hash(authorization.split(" ", 1)[1].strip())
+
+def auth_context(db: Session, code: str, authorization: str | None):
+    """Room + (franchise, is_host) for the bearer token, in ONE query (was two)."""
+    hashed = _bearer_hash(authorization)
     row = db.execute(
         select(Room, Franchise)
         .outerjoin(Franchise, and_(Franchise.room_id == Room.id, Franchise.invite_hash == hashed))
@@ -109,9 +246,11 @@ def auth_context(db: Session, code: str, authorization: str | None):
         raise HTTPException(404, "Room not found")
     room, franchise = row
     if secrets.compare_digest(room.host_token_hash, hashed):
+        _remember(code, hashed)
         return room, None, True
     if franchise is None:
         raise HTTPException(401, "Invalid invite token")
+    _remember(code, hashed)
     return room, franchise, False
 
 def require_host(db, code, authorization):
@@ -125,13 +264,6 @@ def _snapshot_for_room(code):
         room = get_room(db, code)
         return snapshot(db, room)
 
-async def broadcast_snapshot(code):
-    try:
-        data = await asyncio.to_thread(_snapshot_for_room, code)
-    except Exception:
-        return
-    await manager.broadcast(code, {"type": "snapshot", "data": data})
-
 def _read_timer_deadline(code):
     with SessionLocal() as db:
         room = get_room(db, code)
@@ -143,71 +275,75 @@ def _read_timer_deadline(code):
         return lot.ends_at
 
 def _settle_expired_lot(code):
-    with SessionLocal() as db:
-        room = get_room(db, code)
-        # Serialize expiry settlement with incoming bids for this room.
-        with lock_for(room.id):
-            db.refresh(room)
+    """Settle the current player if (and only if) its deadline has really passed.
+
+    Holds the same room lock as bids from the state read to the commit, so a bid that is
+    mid-commit can never be settled underneath, and a settled player can never accept a bid.
+    Returns (settled, next_deadline); next_deadline is the (new) live deadline, or None."""
+    with lock_for(code):
+        with SessionLocal() as db:
+            room = get_room(db, code)      # fresh read, taken inside the lock
             if room.status != "LIVE" or not room.current_lot_id:
-                return False, False
+                return False, None
             lot = db.get(Lot, room.current_lot_id)
-            if not lot or lot.status != "LIVE" or not lot.ends_at or seconds_until(lot.ends_at) > 0:
-                return False, room.status == "LIVE"
+            if not lot or lot.status != "LIVE" or not lot.ends_at:
+                return False, None
+            if seconds_until(lot.ends_at) > 0:     # a bid extended the timer; not expired after all
+                return False, lot.ends_at
             settle_lot(db, room)
-            open_next_lot(db, room)
-            room.version += 1
+            new_lot = open_next_lot(db, room)
+            room.version += 1                      # clients order/validate updates by version
             db.commit()
-            return True, room.status == "LIVE"
+            snap = snapshot(db, room)
+            publish(room.code, {"type": "snapshot", "data": snap})
+            return True, (new_lot.ends_at if new_lot is not None else None)
 
-async def timer_supervisor(code):
-    """Settle persisted deadlines, retry transient DB failures, and follow the next lot.
+async def _settle_and_rearm(code):
+    try:
+        settled, next_deadline = await asyncio.to_thread(_settle_expired_lot, code)
+    except Exception:
+        # Keep the durable state untouched if the database is temporarily unavailable;
+        # try again shortly instead of leaving the player stuck.
+        logger.exception("timer settlement failed room=%s; retrying in 3s", code)
+        arm_timer(code, now_utc() + timedelta(seconds=3))
+        return
+    if next_deadline is not None:
+        arm_timer(code, next_deadline)
 
-    The database remains authoritative. If a bid extends the deadline while this
-    task sleeps, _settle_expired_lot re-reads the room under its lock and reports
-    that it is still live; this loop then reads the new deadline. A transient
-    database error is logged and retried with bounded backoff instead of silently
-    killing the room's timer permanently.
-    """
-    retry_delay = 1.0
-    while True:
-        try:
+async def timer_supervisor(code, deadline=None):
+    """Sleep to the persisted deadline; never poll PostgreSQL several times per second."""
+    try:
+        if deadline is None:
             deadline = await asyncio.to_thread(_read_timer_deadline, code)
-            if deadline is None:
-                return
+        if deadline is None:
+            return
+        await asyncio.sleep(max(0.0, seconds_until(deadline)))
+        # A new bid re-arms (cancels) this task. Once settlement has started it must run to
+        # completion and publish its result, so it runs shielded from that cancellation.
+        await asyncio.shield(_settle_and_rearm(code))
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("timer supervisor error room=%s", code)
 
-            delay = max(0.0, seconds_until(deadline))
-            if delay:
-                await asyncio.sleep(delay)
-
-            settled, still_live = await asyncio.to_thread(_settle_expired_lot, code)
-            retry_delay = 1.0
-            if settled:
-                await broadcast_snapshot(code)
-            if not still_live:
-                return
-            # Either a bid extended the deadline while we slept, or another
-            # operation changed the current lot. Re-read the durable deadline.
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "timer_supervisor_error room=%s retry_in_seconds=%.1f",
-                code, retry_delay
-            )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 10.0)
-
-def arm_timer(code):
+def arm_timer(code, deadline=None):
+    """(Re)start the settlement timer. Pass the freshly committed deadline when known so no
+    database read is needed; with deadline=None it is read from the database."""
+    code = code.upper()
     task = timer_tasks.get(code)
     if task and not task.done():
-        task.cancel()
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass
     try:
-        timer_tasks[code] = asyncio.create_task(timer_supervisor(code))
+        timer_tasks[code] = asyncio.create_task(timer_supervisor(code, deadline))
     except RuntimeError:
         pass
 
 @app.on_event("startup")
 async def recover_live_rooms():
+    _ensure_loop()
     # Do not restart a live timer automatically. Recover the durable auction
     # state, pause the room, and let the host explicitly resume with a full timer.
     with SessionLocal() as db:
@@ -335,236 +471,273 @@ async def import_csv(code: str, file: UploadFile = File(...),
         fail(e)
     return {"imported": len(players)}
 
-@app.post("/api/rooms/{code}/start")
-async def start_auction(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    room = require_host(db, code, authorization)
-    if room.status != "SETUP":
-        raise HTTPException(400, "Auction has already started")
-    players = db.scalars(select(Player).where(Player.room_id == room.id, Player.included == True)).all()
-    if not players:
-        raise HTTPException(400, "The auction pool is empty")
-    if len(players) < room.min_squad * len(db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()):
-        # Warn only; auction can still run if the host intentionally wants fewer purchases.
-        event(db, room.id, "POOL_WARNING", "Player pool is smaller than all minimum squad slots combined.")
-    create_queue(db, room, players)
-    db.flush()
-    open_next_lot(db, room)
-    room.version += 1
-    db.commit()
-    arm_timer(code)
-    result = snapshot(db, room)
-    await broadcast_snapshot(code)
-    return result
+def _locked_host_mutation(code: str, authorization: str | None, mutate):
+    """Run a host-only state change under the room lock (shared with bids and the timer).
 
-def _process_bid(code: str, authorization: str | None, submitted_amount: int):
-    started = time.perf_counter()
-    request_id = uuid.uuid4().hex[:12]
+    authenticate -> lock -> fresh read -> mutate -> version+1 -> commit -> full snapshot -> publish.
+    The version bump and commit happen while the lock is held, so room versions are unique
+    and strictly increasing, and the broadcast is queued in commit order."""
     with SessionLocal() as db:
-        room, franchise, is_host = auth_context(db, code, authorization)
-        auth_done = time.perf_counter()
-        # This lock intentionally covers refresh, validation, write AND commit.
-        # Keep one Uvicorn worker/Render instance while this process-local lock is used.
-        lock_started = time.perf_counter()
-        with lock_for(room.id):
-            lock_acquired = time.perf_counter()
-            db.refresh(room)
-            if is_host:
-                franchise = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
-                if not franchise:
-                    raise HTTPException(403, "Select your franchise in Host controls before bidding.")
-            elif franchise is not None:
-                db.refresh(franchise)
-            try:
-                write_started = time.perf_counter()
-                lot = place_bid(db, room, franchise, submitted_amount)
-                player = db.get(Player, lot.player_id)
-                franchise_name = franchise.name
-                write_done = time.perf_counter()
-                db.commit()
-                commit_done = time.perf_counter()
-            except BidRejected as exc:
-                lot = db.get(Lot, room.current_lot_id) if room.current_lot_id else None
-                detail = {"code": exc.code, "message": exc.message}
-                if lot and lot.status == "LIVE":
-                    leader = db.get(Franchise, lot.highest_franchise_id) if lot.highest_franchise_id else None
-                    detail.update({
-                        "current_bid": lot.current_bid,
-                        "leading_franchise": leader.name if leader else None,
-                        "leading_franchise_id": leader.id if leader else None,
-                        "next_bid": next_bid_amount(lot),
-                        "timer_deadline": lot.ends_at.isoformat().replace("+00:00", "Z") if lot.ends_at else None,
-                        "room_version": room.version,
-                        "lot_id": lot.id,
-                    })
-                db.rollback()
-                logger.info("bid_rejected room=%s code=%s submitted=%s", code, exc.code, submitted_amount)
-                raise HTTPException(status_code=409, detail=detail)
-            except ValueError as exc:
-                db.rollback()
-                logger.info("bid_rejected room=%s reason=%s", code, str(exc))
-                raise HTTPException(status_code=400, detail=str(exc))
-        # The response is deliberately compact. Full snapshots are reserved for
-        # initial load, joins, reconnects and explicit recovery.
-        result = {
-            "type": "BID_ACCEPTED", "accepted": True,
-            "room_version": room.version,
-            "lot_id": lot.id, "player_id": player.id, "player_name": player.name,
-            "highest_bid": lot.current_bid,
-            "leading_franchise_id": franchise.id,
-            "leading_franchise_name": franchise_name,
-            "next_bid_amount": next_bid_amount(lot),
-            "timer_deadline": lot.ends_at.isoformat().replace("+00:00", "Z") if lot.ends_at else None,
-        }
-        logger.info(
-            "bid_timing request_id=%s room=%s submitted=%s outcome=accepted accepted_amount=%s version=%s auth_ms=%.1f lock_wait_ms=%.1f write_ms=%.1f commit_ms=%.1f total_ms=%.1f",
-            request_id, code, submitted_amount, result["highest_bid"], result["room_version"],
-            (auth_done-started)*1000, (lock_acquired-lock_started)*1000,
-            (write_done-write_started)*1000, (commit_done-write_done)*1000,
-            (time.perf_counter()-started)*1000
-        )
-        return result
-
-@app.post("/api/rooms/{code}/bid")
-async def bid(code: str, payload: BidRequest, authorization: str | None = Header(default=None)):
-    if payload.amount is None:
-        raise HTTPException(422, "The exact bid amount is required")
-    result = await asyncio.to_thread(_process_bid, code, authorization, payload.amount)
-    arm_timer(code)
-    # A failed socket delivery cannot undo the already committed bid.
-    asyncio.create_task(manager.broadcast(code, {"type": "bid", "data": result}))
-    return result
-
-@app.post("/api/rooms/{code}/host/select-franchise")
-async def select_host_franchise(code: str, payload: dict,
-        authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    room = require_host(db, code, authorization)
-    if room.status != "SETUP":
-        raise HTTPException(400, "Choose the host's franchise before the auction starts")
-    franchise_id = payload.get("franchise_id")
-    franchise = db.scalar(select(Franchise).where(Franchise.id == franchise_id, Franchise.room_id == room.id)) if franchise_id else None
-    if franchise_id and not franchise:
-        raise HTTPException(404, "Franchise not found in this room")
-    room.host_franchise_id = franchise.id if franchise else None
-    room.version += 1
-    db.commit()
-    result = snapshot(db, room)
-    await broadcast_snapshot(code)
-    return result
-
-def _process_host_action(code: str, action: str, authorization: str | None):
-    with SessionLocal() as db:
-        room = require_host(db, code, authorization)
-        with lock_for(room.id):
+        room, _franchise, is_host = auth_context(db, code, authorization)
+        if not is_host:
+            raise HTTPException(403, "Host permission required")
+        with lock_for(room.code):
             db.refresh(room)
             try:
-                if action == "pause":
-                    pause_room(db, room)
-                elif action == "resume":
-                    resume_room(db, room)
-                elif action == "advance":
-                    if room.status == "LIVE":
-                        lot = db.get(Lot, room.current_lot_id)
-                        if lot:
-                            lot.ends_at = now_utc()
-                            settle_lot(db, room)
-                    open_next_lot(db, room)
-                elif action == "undo-sale":
-                    undo_last_sale(db, room)
-                    if room.status not in ("LIVE", "PAUSED", "COMPLETED"):
-                        open_next_lot(db, room)
-                elif action == "undo-bid":
-                    undo_last_bid(db, room)
-                elif action == "redo-bid":
-                    redo_last_bid(db, room)
-                elif action == "redo-sale":
-                    redo_last_sale(db, room)
-                    if room.current_lot_id is None and room.status not in ("LIVE", "PAUSED", "COMPLETED"):
-                        open_next_lot(db, room)
-                elif action == "finish":
-                    if room.current_lot_id:
-                        active_lot = db.get(Lot, room.current_lot_id)
-                        if active_lot and active_lot.status in ("LIVE", "PAUSED"):
-                            active_lot.status = "LIVE"
-                            active_lot.ends_at = now_utc()
-                            settle_lot(db, room)
-                    room.status = "COMPLETED"
-                    room.current_lot_id = None
-                    event(db, room.id, "COMPLETED", "Auction marked complete.")
-                else:
-                    raise ValueError("Unknown host action")
+                mutate(db, room)
                 room.version += 1
                 db.commit()
-                return snapshot(db, room)
             except ValueError as e:
                 db.rollback()
                 raise HTTPException(status_code=400, detail=str(e))
+            snap = snapshot(db, room)
+            publish(room.code, {"type": "snapshot", "data": snap})
+            return snap
+
+def _start_auction(code, authorization):
+    def mutate(db, room):
+        if room.status != "SETUP":
+            raise HTTPException(400, "Auction has already started")
+        players = db.scalars(select(Player).where(Player.room_id == room.id, Player.included == True)).all()
+        if not players:
+            raise HTTPException(400, "The auction pool is empty")
+        if len(players) < room.min_squad * len(db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()):
+            # Warn only; auction can still run if the host intentionally wants fewer purchases.
+            event(db, room.id, "POOL_WARNING", "Player pool is smaller than all minimum squad slots combined.")
+        create_queue(db, room, players)
+        db.flush()
+        open_next_lot(db, room)
+    return _locked_host_mutation(code, authorization, mutate)
+
+@app.post("/api/rooms/{code}/start")
+async def start_auction(code: str, authorization: str | None = Header(default=None)):
+    _ensure_loop()
+    result = await asyncio.to_thread(_start_auction, code, authorization)
+    arm_timer(code)
+    return result
+
+def _log_bid(**fields):
+    logger.info("bid_timing " + " ".join(f"{k}={v}" for k, v in fields.items()))
+
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str):
+    """Authenticate, validate, write and COMMIT one bid; never touches a full snapshot.
+
+    Returns (http_status, body, rearm_deadline). Round trips on the normal path (excluding the
+    pool's pre-ping): one combined authenticate+read, then lot UPDATE, room UPDATE, bid INSERT,
+    event INSERT, COMMIT. The bid is acknowledged only after COMMIT has returned."""
+    t_start = time.perf_counter()
+    code = code.upper()
+    hashed = _bearer_hash(authorization)
+    if (code, hashed) not in _verified:
+        # First bid from this credential in this process: verify it BEFORE queueing for the
+        # lock, so unauthenticated callers can never hold up real bidders.
+        with SessionLocal() as pre:
+            auth_context(pre, code, authorization)
+    t_auth = time.perf_counter()
+    timings = {}
+    base = dict(request_id=request_id, room=code, submitted=req.amount)
+    perf.begin()
+    traced = True
+    try:
+        with SessionLocal() as db:
+            t_wait = time.perf_counter()
+            with lock_for(code):
+                t_locked = time.perf_counter()
+                ctx = None
+                wrote = False
+                committing = False
+                try:
+                    ctx = load_bid_context(db, code, hashed)       # authenticate + read state (1 round trip)
+                    t_read = time.perf_counter()
+                    validate_bid(ctx, req.amount, lot_id=req.lot_id, player_id=req.player_id,
+                                 franchise_id=req.franchise_id)
+                    t_valid = time.perf_counter()
+                    wrote = True
+                    accepted = apply_bid(db, ctx, req.amount)
+                    t_write = time.perf_counter()
+                    committing = True
+                    db.commit()
+                    committing = False
+                    t_commit = time.perf_counter()
+                    # Build the response from the values just committed. No further reads.
+                    body = dict(accepted, accepted=True, request_id=request_id,
+                                your_franchise_id=ctx.franchise.id)
+                    t_resp = time.perf_counter()
+                    publish(code, accepted)                          # queued in commit order; cannot block
+                    t_pub = time.perf_counter()
+                    n, sql = perf.summarise(perf.end()); traced = False
+                    _log_bid(**base, outcome="accepted", accepted_amount=req.amount,
+                             version=accepted["room_version"],
+                             auth_ms=f"{(t_auth-t_start)*1000:.1f}", lock_wait_ms=f"{(t_locked-t_wait)*1000:.1f}",
+                             read_auth_ms=f"{(t_read-t_locked)*1000:.1f}",
+                             validate_ms=f"{(t_valid-t_read)*1000:.1f}",
+                             write_ms=f"{(t_write-t_valid)*1000:.1f}", commit_ms=f"{(t_commit-t_write)*1000:.1f}",
+                             response_ms=f"{(t_resp-t_commit)*1000:.1f}", broadcast_enqueue_ms=f"{(t_pub-t_resp)*1000:.1f}",
+                             total_ms=f"{(t_pub-t_start)*1000:.1f}", db_stmts=n, **({"sql": sql} if sql else {}))
+                    return 200, body, ctx.lot.ends_at   # new committed deadline (re-arms the timer without a DB read)
+                except BidRejected as rej:
+                    state = compact_state(ctx) if ctx is not None else None   # before any rollback expires ctx
+                    rearm = ctx.lot.ends_at if (ctx is not None and rej.code == "TIMER_EXPIRED") else None
+                    if wrote:
+                        db.rollback()
+                    n, sql = perf.summarise(perf.end()); traced = False
+                    _log_bid(**base, outcome="rejected", reason=rej.code,
+                             version=(state or {}).get("room_version", ""),
+                             auth_ms=f"{(t_auth-t_start)*1000:.1f}", lock_wait_ms=f"{(t_locked-t_wait)*1000:.1f}",
+                             total_ms=f"{(time.perf_counter()-t_start)*1000:.1f}", db_stmts=n)
+                    body = {"accepted": False, "code": rej.code, "detail": rej.message,
+                            "request_id": request_id, "submitted_amount": req.amount, "state": state}
+                    return rej.http_status, body, rearm
+                except AuthError as e:
+                    raise HTTPException(e.status, e.message)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    # Nothing is acknowledged and nothing is broadcast. The database is authoritative.
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    code_ = "BID_NOT_CONFIRMED" if committing else "BID_NOT_SAVED"
+                    logger.exception("bid_failed request_id=%s room=%s reason=%s err=%s", request_id, code, code_, type(e).__name__)
+                    msg = ("Your bid could not be confirmed. Check the current price before bidding again."
+                           if committing else "Your bid was NOT placed (server error). Please try again.")
+                    return 503, {"accepted": False, "code": code_, "detail": msg,
+                                 "request_id": request_id, "submitted_amount": req.amount, "state": None}, None
+    finally:
+        if traced:
+            perf.end()
+
+@app.post("/api/rooms/{code}/bid")
+async def bid(code: str, payload: BidRequest, authorization: str | None = Header(default=None),
+              x_request_id: str | None = Header(default=None)):
+    _ensure_loop()
+    request_id = x_request_id if x_request_id and _REQUEST_ID.match(x_request_id) else uuid.uuid4().hex[:12]
+    # SQLAlchemy uses a synchronous psycopg connection. Run the whole transaction
+    # off the event loop so it cannot stall WebSockets, timers, or other bidders.
+    status, body, rearm = await asyncio.to_thread(_process_bid, code, authorization, payload, request_id)
+    if rearm is not None:
+        arm_timer(code, rearm)   # accepted: new deadline; TIMER_EXPIRED: settle immediately
+    if status == 200:
+        return body
+    return JSONResponse(body, status_code=status)
+
+def _select_host_franchise(code, authorization, franchise_id):
+    def mutate(db, room):
+        if room.status != "SETUP":
+            raise HTTPException(400, "Choose the host's franchise before the auction starts")
+        franchise = db.scalar(select(Franchise).where(Franchise.id == franchise_id, Franchise.room_id == room.id)) if franchise_id else None
+        if franchise_id and not franchise:
+            raise HTTPException(404, "Franchise not found in this room")
+        room.host_franchise_id = franchise.id if franchise else None
+    return _locked_host_mutation(code, authorization, mutate)
+
+@app.post("/api/rooms/{code}/host/select-franchise")
+async def select_host_franchise(code: str, payload: dict, authorization: str | None = Header(default=None)):
+    _ensure_loop()
+    return await asyncio.to_thread(_select_host_franchise, code, authorization, payload.get("franchise_id"))
+
+def _apply_host_action(db, room, action):
+    if action == "pause":
+        pause_room(db, room)
+    elif action == "resume":
+        resume_room(db, room)
+    elif action == "advance":
+        if room.status == "LIVE":
+            lot = db.get(Lot, room.current_lot_id)
+            if lot:
+                lot.ends_at = now_utc()
+                settle_lot(db, room)
+        open_next_lot(db, room)
+    elif action == "undo-sale":
+        undo_last_sale(db, room)
+        if room.status not in ("LIVE", "PAUSED", "COMPLETED"):
+            open_next_lot(db, room)
+    elif action == "undo-bid":
+        undo_last_bid(db, room)
+    elif action == "redo-bid":
+        redo_last_bid(db, room)
+    elif action == "redo-sale":
+        redo_last_sale(db, room)
+        if room.current_lot_id is None and room.status not in ("LIVE", "PAUSED", "COMPLETED"):
+            open_next_lot(db, room)
+    elif action == "finish":
+        if room.current_lot_id:
+            active_lot = db.get(Lot, room.current_lot_id)
+            if active_lot and active_lot.status in ("LIVE", "PAUSED"):
+                active_lot.status = "LIVE"
+                active_lot.ends_at = now_utc()
+                settle_lot(db, room)
+        room.status = "COMPLETED"
+        room.current_lot_id = None
+        event(db, room.id, "COMPLETED", "Auction marked complete.")
+    else:
+        raise ValueError("Unknown host action")
+
+def _process_host_action(code: str, action: str, authorization: str | None):
+    return _locked_host_mutation(code, authorization, lambda db, room: _apply_host_action(db, room, action))
 
 @app.post("/api/rooms/{code}/host/{action}")
 async def host_action(code: str, action: str, authorization: str | None = Header(default=None)):
+    _ensure_loop()
     result = await asyncio.to_thread(_process_host_action, code, action, authorization)
     if action in ("resume", "advance", "undo-bid", "redo-bid", "undo-sale", "redo-sale"):
         arm_timer(code)
     elif action in ("pause", "finish"):
-        task = timer_tasks.get(code)
+        task = timer_tasks.get(code.upper())
         if task:
             task.cancel()
-    asyncio.create_task(manager.broadcast(code, {"type": "snapshot", "data": result}))
     return result
 
+def _nominate(code, authorization, payload):
+    def mutate(db, room):
+        nominated_unsold(db, room, payload.player_ids, payload.price_overrides)
+    return _locked_host_mutation(code, authorization, mutate)
+
 @app.post("/api/rooms/{code}/nominate-unsold")
-async def nominate(code: str, payload: NominationRequest,
-             authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    room = require_host(db, code, authorization)
-    # This action can settle the current lot and open another one, so it must
-    # serialize with both bids and timer settlement using the same room lock.
-    with lock_for(room.id):
-        db.refresh(room)
-        try:
-            nominated_unsold(db, room, payload.player_ids, payload.price_overrides)
-            room.version += 1
-            db.commit()
-        except ValueError as e:
-            db.rollback()
-            fail(e)
-        result = snapshot(db, room)
-    if room.status == "LIVE":
+async def nominate(code: str, payload: NominationRequest, authorization: str | None = Header(default=None)):
+    _ensure_loop()
+    result = await asyncio.to_thread(_nominate, code, authorization, payload)
+    if result["room"]["status"] == "LIVE":
         arm_timer(code)
-    await broadcast_snapshot(code)
     return result
+
+def _ws_authorised(code, token):
+    try:
+        with SessionLocal() as db:
+            auth_context(db, code, "Bearer " + token)
+        return True
+    except Exception:
+        return False
 
 @app.websocket("/ws/{code}")
 async def websocket_endpoint(ws: WebSocket, code: str, token: str):
-    with SessionLocal() as db:
-        try:
-            room = get_room(db, code)
-            hashed = token_hash(token)
-            valid = secrets.compare_digest(room.host_token_hash, hashed) or bool(
-                get_franchise_by_token(db, room.id, hashed)
-            )
-            if not valid:
-                await ws.close(code=1008)
-                return
-        except Exception:
-            await ws.close(code=1008)
-            return
-    await manager.connect(code, ws)
-    try:
-        initial = await asyncio.to_thread(_snapshot_for_room, code)
-        await ws.send_json({"type": "snapshot", "data": initial})
-    except Exception:
-        manager.disconnect(code, ws)
-        await ws.close(code=1011)
+    _ensure_loop()
+    if not await asyncio.to_thread(_ws_authorised, code, token):
+        await ws.close(code=1008)
         return
+    conn = await manager.connect(code, ws)
     try:
+        # State recovery for THIS client only (join / reconnect). Other clients are not
+        # sent anything: previously every reconnect pushed a full snapshot to the whole room.
+        try:
+            snap = await asyncio.to_thread(_snapshot_for_room, code)
+            conn.send(json.dumps({"type": "snapshot", "reason": "connect", "data": snap}, separators=(",", ":")))
+        except Exception:
+            logger.exception("initial snapshot failed room=%s", code)
         while True:
             # Browser clients send an application-level heartbeat so hosted
             # proxies can detect and preserve otherwise-idle WebSocket sessions.
             # Auction mutations still only use authenticated HTTP endpoints.
             message = await ws.receive_text()
             if message == "ping" or message == '{"type":"ping"}':
-                await ws.send_json({"type": "pong"})
+                conn.send('{"type":"pong"}')
     except WebSocketDisconnect:
-        manager.disconnect(code, ws)
+        pass
+    finally:
+        manager.disconnect(code, conn)
 
 @app.get("/api/rooms/{code}/events")
 def get_events(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):

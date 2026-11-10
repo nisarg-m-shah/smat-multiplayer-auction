@@ -1,27 +1,38 @@
+import os, secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from threading import RLock, Lock
-from sqlalchemy import select, desc, func
-from sqlalchemy.orm import Session
+from sqlalchemy import select, desc, func, exists, and_, or_, update, insert, literal, true, JSON, Integer, Boolean, DateTime, String
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm.attributes import set_committed_value
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .seed import weighted_random_order
 
 # One-process lock is a useful guard for this 10-person application.
 # Database transactions remain the persistent source of truth.
-_room_locks: dict[int, RLock] = {}
+# The lock is keyed by ROOM CODE (not room id) so a request can take it before it
+# has read anything from the database. Everything that changes room state (bids,
+# timer settlement, host actions) must hold it from the state read to the commit.
+_room_locks: dict = {}
 _room_locks_guard = Lock()
 
-def lock_for(room_id: int):
-    # Protect first-use creation too: two simultaneous first requests must not
-    # accidentally receive two different locks for the same room.
-    with _room_locks_guard:
-        lock = _room_locks.get(room_id)
+def lock_for(room_key):
+    key = room_key.upper() if isinstance(room_key, str) else room_key
+    with _room_locks_guard:  # dict creation must itself be thread-safe
+        lock = _room_locks.get(key)
         if lock is None:
-            lock = RLock()
-            _room_locks[room_id] = lock
+            lock = _room_locks[key] = RLock()
         return lock
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+def iso_utc(value):
+    """UTC ISO-8601 with a trailing Z. SQLite may return naive datetimes; all deadlines are UTC."""
+    if value is None:
+        return None
+    value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
 
 def seconds_until(value):
     if value is None:
@@ -39,10 +50,13 @@ def increment_for(current_bid: int) -> int:
         return 20
     return 25
 
+def next_bid_for(current_bid: int, base_price: int) -> int:
+    if current_bid == 0:
+        return base_price
+    return current_bid + increment_for(current_bid)
+
 def next_bid_amount(lot: Lot) -> int:
-    if lot.current_bid == 0:
-        return lot.base_price
-    return lot.current_bid + increment_for(lot.current_bid)
+    return next_bid_for(lot.current_bid, lot.base_price)
 
 def event(db: Session, room_id: int, kind: str, message: str, data=None):
     db.add(Event(room_id=room_id, kind=kind, message=message, data=data or {}))
@@ -149,62 +163,277 @@ def settle_lot(db: Session, room: Room):
     db.flush()
     return True
 
+# ---------------------------------------------------------------------------
+# Bidding
+#
+# A bid is an instruction to buy the CURRENT player at an EXACT amount that the
+# bidder saw on screen. The server never changes that amount: if it is not
+# exactly the price required right now, the bid is rejected (STALE_BID) and the
+# bidder is told the new price so they can decide again.
+# ---------------------------------------------------------------------------
+
 class BidRejected(ValueError):
-    def __init__(self, code: str, message: str):
+    """A bid that failed validation. Subclasses ValueError so older callers still work."""
+    def __init__(self, code: str, message: str, http_status: int = 409):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.http_status = http_status
 
 
-def place_bid(db: Session, room: Room, franchise: Franchise, amount: int | None = None):
-    with lock_for(room.id):
+class AuthError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+@dataclass
+class BidContext:
+    """Everything needed to validate (and describe) one bid, read in ONE query."""
+    room: Room
+    lot: Lot | None
+    franchise: Franchise | None
+    is_host: bool
+    sold: int = 0
+    has_redo: bool = False
+    leader_name: str | None = None
+    player_name: str | None = None
+
+
+def load_bid_context(db: Session, code: str, hashed_token: str) -> BidContext:
+    """Authenticate the token AND read the live auction state in a single round trip.
+
+    The franchise is derived from the credential inside the database query, never
+    from anything the browser claims: a franchise token matches its own franchise
+    row; the host token matches the host's chosen franchise (if any).
+    Must be called while holding the room lock so the state read is current.
+    """
+    Leader = aliased(Franchise)
+    sold_sq = (select(func.count(Sale.id))
+               .where(Sale.franchise_id == Franchise.id, Sale.reversed == False)  # noqa: E712
+               .correlate(Franchise).scalar_subquery())
+    redo_sq = (exists().where(Bid.lot_id == Lot.id, Bid.redo_available == True)  # noqa: E712
+               .correlate(Lot))
+    stmt = (
+        select(Room, Lot, Franchise, Leader.name, Player.name, sold_sq, redo_sq)
+        .select_from(Room)
+        .outerjoin(Lot, Lot.id == Room.current_lot_id)
+        .outerjoin(Franchise, and_(
+            Franchise.room_id == Room.id,
+            or_(Franchise.invite_hash == hashed_token,
+                and_(Room.host_token_hash == hashed_token, Franchise.id == Room.host_franchise_id))))
+        .outerjoin(Leader, Leader.id == Lot.highest_franchise_id)
+        .outerjoin(Player, Player.id == Lot.player_id)
+        .where(Room.code == code.upper())
+        .limit(1)
+    )
+    row = db.execute(stmt).first()
+    if row is None:
+        raise AuthError(404, "Room not found")
+    room, lot, franchise, leader_name, player_name, sold, has_redo = row
+    is_host = secrets.compare_digest(room.host_token_hash, hashed_token)
+    if not is_host and franchise is None:
+        raise AuthError(401, "Invalid invite token")
+    return BidContext(room=room, lot=lot, franchise=franchise, is_host=is_host,
+                      sold=int(sold or 0), has_redo=bool(has_redo),
+                      leader_name=leader_name, player_name=player_name)
+
+
+def required_amount(ctx: BidContext) -> int | None:
+    return next_bid_amount(ctx.lot) if ctx.lot is not None else None
+
+
+def validate_bid(ctx: BidContext, amount: int, *, lot_id: int | None = None,
+                 player_id: int | None = None, franchise_id: int | None = None) -> int:
+    """Pure validation against the latest committed state. Returns the required amount.
+
+    Raises BidRejected(code, ...) with a distinguishable code; never adjusts `amount`.
+    """
+    room, lot, franchise = ctx.room, ctx.lot, ctx.franchise
+    if franchise is None:
+        raise BidRejected("FRANCHISE_NOT_AUTHORISED",
+                          "Select your franchise in Host controls before bidding.", 403)
+    if franchise_id is not None and int(franchise_id) != franchise.id:
+        raise BidRejected("FRANCHISE_NOT_AUTHORISED",
+                          "This request does not match the franchise your invite link controls.", 403)
+    settled_like = ("BETWEEN_LOTS", "ROUND_COMPLETE", "COMPLETED")
+    if lot is None:
+        if lot_id is not None and room.status in settled_like:
+            raise BidRejected("PLAYER_ALREADY_SETTLED", "This player has already been settled.")
+        raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
+    if (lot_id is not None and int(lot_id) != lot.id) or (player_id is not None and int(player_id) != lot.player_id):
+        raise BidRejected("PLAYER_ALREADY_SETTLED",
+                          "That player has already been settled; a different player is now up.")
+    if room.status != "LIVE" or lot.status != "LIVE":
+        raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
+    if not lot.ends_at or seconds_until(lot.ends_at) <= 0:
+        raise BidRejected("TIMER_EXPIRED", "The bidding timer has expired")
+    if ctx.sold >= room.max_squad:
+        raise BidRejected("SQUAD_FULL", "Your squad is already full")
+    if lot.highest_franchise_id == franchise.id:
+        raise BidRejected("ALREADY_HIGHEST_BIDDER", "Your franchise is already the highest bidder")
+    expected = next_bid_amount(lot)
+    if amount != expected:
+        raise BidRejected("STALE_BID",
+                          f"Price changed: {expected} is now required (you submitted {amount}). "
+                          f"Review the latest bid and bid again if you still want this player.")
+    if franchise.purse_remaining < amount:
+        raise BidRejected("INSUFFICIENT_PURSE", "Insufficient remaining purse")
+    # After winning this player, reserve only for the remaining required squad slots.
+    reserve = max(0, room.min_squad - ctx.sold - 1) * 10
+    if franchise.purse_remaining - amount < reserve:
+        raise BidRejected("INSUFFICIENT_PURSE",
+                          "This bid would leave insufficient purse to complete your minimum squad")
+    return expected
+
+
+def compact_state(ctx: BidContext, *, server_time=None) -> dict:
+    """Small description of the live bidding state (used in 409 responses)."""
+    lot, room = ctx.lot, ctx.room
+    return {
+        "room_version": room.version, "room_status": room.status,
+        "lot_id": lot.id if lot else None, "player_id": lot.player_id if lot else None,
+        "player_name": ctx.player_name if lot else None,
+        "highest_bid": lot.current_bid if lot else None,
+        "leading_franchise_id": lot.highest_franchise_id if lot else None,
+        "leading_franchise_name": ctx.leader_name if lot else None,
+        "next_bid_amount": next_bid_amount(lot) if lot else None,
+        "timer_deadline": iso_utc(lot.ends_at) if lot else None,
+        "server_time": iso_utc(server_time or now_utc()),
+    }
+
+
+
+# PostgreSQL only: perform the lot UPDATE, room version bump, bid INSERT and event INSERT as ONE
+# statement (data-modifying CTEs) = one network round trip instead of four. The bid and event rows
+# are inserted FROM the lot UPDATE's RETURNING row, so if the guarded lot UPDATE matches nothing
+# (superseded bid) nothing at all is written. Disable with BID_FUSED_WRITE=0 to fall back to the
+# portable four-statement path (always used on SQLite).
+FUSED_WRITE = os.getenv("BID_FUSED_WRITE", "1") != "0"
+
+
+def _fused_bid_write(db: Session, ctx: "BidContext", amount: int, new_seq: int, new_ends, now, message: str):
+    lot, room, franchise = ctx.lot, ctx.room, ctx.franchise
+    ts = DateTime(timezone=True)
+    upd_lot = (update(Lot)
+               .where(Lot.id == lot.id, Lot.bid_sequence == lot.bid_sequence, Lot.status == "LIVE")
+               .values(current_bid=amount, highest_franchise_id=franchise.id, bid_sequence=new_seq, ends_at=new_ends)
+               .returning(Lot.id).cte("upd_lot"))
+    upd_room = (update(Room)
+                .where(Room.id == room.id, exists(select(upd_lot.c.id)))
+                .values(version=Room.version + 1)
+                .returning(Room.version).cte("upd_room"))
+    ins_bid = (insert(Bid).from_select(
+        ["room_id", "lot_id", "franchise_id", "amount", "sequence_no", "accepted_at", "active", "redo_available"],
+        select(literal(room.id, Integer), upd_lot.c.id, literal(franchise.id, Integer), literal(amount, Integer),
+               literal(new_seq, Integer), literal(now, ts), literal(True, Boolean), literal(False, Boolean))
+        .select_from(upd_lot)).returning(Bid.id).cte("ins_bid"))
+    ins_event = (insert(Event).from_select(
+        ["room_id", "kind", "message", "data", "created_at"],
+        select(literal(room.id, Integer), literal("BID", String), literal(message, String),
+               literal({"lot_id": lot.id, "franchise_id": franchise.id, "amount": amount}, JSON),
+               literal(now, ts))
+        .select_from(upd_lot)).returning(Event.id).cte("ins_event"))
+    stmt = (select(upd_room.c.version, ins_event.c.id.label("event_id"))
+            .select_from(upd_lot)
+            .join(upd_room, true()).join(ins_bid, true()).join(ins_event, true()))
+    return db.execute(stmt).first()
+
+
+def apply_bid(db: Session, ctx: BidContext, amount: int) -> dict:
+    """Write an already-validated bid. Does NOT commit. Returns the BID_ACCEPTED event.
+
+    Round trips: [redo reset, only if one exists] + lot UPDATE + room UPDATE + bid INSERT + event INSERT.
+    The lot UPDATE is guarded (WHERE bid_sequence = <value we validated against>), so even if
+    something outside this process's lock changed the lot, a bid can never overwrite a newer one:
+    zero rows matched => STALE_BID and the transaction is rolled back by the caller.
+    """
+    room, lot, franchise = ctx.room, ctx.lot, ctx.franchise
+    old_seq, new_seq = lot.bid_sequence, lot.bid_sequence + 1
+    now = now_utc()
+    new_ends = lot.ends_at
+    if room.bid_extension:
+        # Add half the configured timer, but never extend beyond one full timer window from now.
+        old_remaining = max(0.0, seconds_until(lot.ends_at))
+        new_remaining = min(room.timer_seconds, old_remaining + room.timer_seconds / 2)
+        new_ends = now + timedelta(seconds=new_remaining)
+    if ctx.has_redo:
+        # A new bid after an undo creates a new branch; discard the old redo path.
+        db.execute(update(Bid).where(Bid.lot_id == lot.id, Bid.redo_available == True)  # noqa: E712
+                   .values(redo_available=False))
+    message = f"{franchise.name} bid {amount}."
+    if FUSED_WRITE and db.get_bind().dialect.name == "postgresql":
+        row = _fused_bid_write(db, ctx, amount, new_seq, new_ends, now, message)
+        if row is None:
+            raise BidRejected("STALE_BID", "The bid was superseded by a newer bid. Review the latest price.")
+        new_version, event_id, event_created = row.version, row.event_id, now
+    else:
+        result = db.execute(
+            update(Lot).where(Lot.id == lot.id, Lot.bid_sequence == old_seq, Lot.status == "LIVE")
+            .values(current_bid=amount, highest_franchise_id=franchise.id, bid_sequence=new_seq, ends_at=new_ends))
+        if result.rowcount != 1:
+            raise BidRejected("STALE_BID", "The bid was superseded by a newer bid. Review the latest price.")
+        bump = update(Room).where(Room.id == room.id).values(version=Room.version + 1)
+        if db.get_bind().dialect.update_returning:
+            new_version = db.execute(bump.returning(Room.version)).scalar_one()
+        else:
+            db.execute(bump)
+            new_version = room.version + 1
+        bid_row = Bid(room_id=room.id, lot_id=lot.id, franchise_id=franchise.id, amount=amount, sequence_no=new_seq,
+                      accepted_at=now)
+        event_row = Event(room_id=room.id, kind="BID", message=message, created_at=now,
+                          data={"lot_id": lot.id, "franchise_id": franchise.id, "amount": amount})
+        db.add_all([bid_row, event_row])
+        db.flush()
+        event_id, event_created = event_row.id, now
+    # Keep long-lived ORM objects (used by callers that reuse the session) consistent
+    # without scheduling another UPDATE.
+    for obj, attr, value in ((lot, "current_bid", amount), (lot, "highest_franchise_id", franchise.id),
+                             (lot, "bid_sequence", new_seq), (lot, "ends_at", new_ends),
+                             (room, "version", new_version)):
+        set_committed_value(obj, attr, value)
+    return {
+        "type": "BID_ACCEPTED",
+        "room_version": new_version,
+        "lot_id": lot.id, "player_id": lot.player_id, "player_name": ctx.player_name,
+        "highest_bid": amount,
+        "leading_franchise_id": franchise.id, "leading_franchise_name": franchise.name,
+        "next_bid_amount": next_bid_for(amount, lot.base_price),
+        "timer_deadline": iso_utc(new_ends),
+        "bid_sequence": new_seq,
+        "server_time": iso_utc(now),
+        "event": {"id": event_id, "kind": "BID", "message": message,
+                  "created_at": event_created.isoformat()},
+    }
+
+
+def place_bid(db: Session, room: Room, franchise: Franchise, amount: int, *,
+              lot_id: int | None = None):
+    """Object-based entry point (used by unit tests and scripts). The HTTP path uses
+    load_bid_context + validate_bid + apply_bid directly to minimise round trips."""
+    if amount is None:
+        raise BidRejected("STALE_BID", "An exact bid amount is required", 422)
+    with lock_for(room.code):
         db.refresh(room)
         if franchise is not None:
             db.refresh(franchise)
         lot = current_lot(db, room)
-        if room.status != "LIVE" or not lot or lot.status != "LIVE":
-            raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
-        if not lot.ends_at or seconds_until(lot.ends_at) <= 0:
-            raise BidRejected("BID_WINDOW_EXPIRED", "The bidding timer has expired")
-        if sold_count(db, franchise.id) >= room.max_squad:
-            raise BidRejected("SQUAD_FULL", "Your squad is already full")
-        if lot.highest_franchise_id == franchise.id:
-            raise BidRejected("ALREADY_HIGHEST_BIDDER", "Your franchise is already the highest bidder")
-        expected = next_bid_amount(lot)
-        # A bid is the exact amount the participant consciously selected.
-        # Never silently turn a stale click into a higher bid.
-        if amount is None or int(amount) != expected:
-            raise BidRejected("STALE_BID", f"This bid is outdated. The next required bid is {expected}.")
-        amount = int(amount)
-        # After winning this player, reserve only for the remaining required squad slots.
-        slots_after_this_purchase = max(0, room.min_squad - sold_count(db, franchise.id) - 1)
-        reserve = slots_after_this_purchase * 10
-        if franchise.purse_remaining - amount < reserve:
-            raise BidRejected("INSUFFICIENT_RESERVE", "This bid would leave insufficient purse to complete your minimum squad")
-        if franchise.purse_remaining < amount:
-            raise BidRejected("INSUFFICIENT_PURSE", "Insufficient remaining purse")
-        # A new bid after an undo creates a new branch; discard the old redo path.
-        db.query(Bid).filter(Bid.lot_id == lot.id, Bid.redo_available == True).update(
-            {Bid.redo_available: False}, synchronize_session=False
+        ctx = BidContext(
+            room=room, lot=lot, franchise=franchise, is_host=False,
+            sold=sold_count(db, franchise.id) if franchise is not None else 0,
+            has_redo=bool(lot and db.scalar(select(exists().where(Bid.lot_id == lot.id, Bid.redo_available == True)))),  # noqa: E712
+            leader_name=(db.scalar(select(Franchise.name).where(Franchise.id == lot.highest_franchise_id))
+                         if lot and lot.highest_franchise_id else None),
+            player_name=(db.scalar(select(Player.name).where(Player.id == lot.player_id)) if lot else None),
         )
-        lot.current_bid = amount
-        lot.highest_franchise_id = franchise.id
-        lot.bid_sequence += 1
-        db.add(Bid(room_id=room.id, lot_id=lot.id, franchise_id=franchise.id,
-                   amount=amount, sequence_no=lot.bid_sequence))
-        if room.bid_extension:
-            # Add half the configured timer, but never extend beyond one full timer window from now.
-            old_remaining = max(0.0, seconds_until(lot.ends_at))
-            new_remaining = min(room.timer_seconds, old_remaining + room.timer_seconds / 2)
-            lot.ends_at = now_utc() + timedelta(seconds=new_remaining)
-        event(db, room.id, "BID", f"{franchise.name} bid {amount}.",
-              {"lot_id": lot.id, "franchise_id": franchise.id, "amount": amount})
-        room.version += 1
-        db.flush()
+        validate_bid(ctx, amount, lot_id=lot_id)
+        apply_bid(db, ctx, amount)
         return lot
 
+
 def host_advance(db: Session, room: Room):
-    with lock_for(room.id):
+    with lock_for(room.code):
         if room.status == "LIVE":
             lot = current_lot(db, room)
             if lot:
@@ -472,10 +701,7 @@ def snapshot(db: Session, room: Room):
             "role": p.role, "state_team": p.state_team, "base_price": live.base_price,
             "current_bid": live.current_bid, "highest_franchise_id": live.highest_franchise_id,
             "highest_franchise": next((f.name for f in franchises if f.id == live.highest_franchise_id), None),
-            # SQLite may strip tzinfo when reading DateTime(timezone=True).
-            # All auction deadlines are created in UTC, so explicitly label them UTC
-            # before sending them to browsers in different time zones.
-            "ends_at": (live.ends_at.replace(tzinfo=timezone.utc) if live.ends_at.tzinfo is None else live.ends_at.astimezone(timezone.utc)).isoformat().replace("+00:00", "Z") if live.ends_at else None,
+            "ends_at": iso_utc(live.ends_at),
             "status": live.status, "round_no": live.round_no,
             "next_bid": next_bid_amount(live)
         }
@@ -484,6 +710,8 @@ def snapshot(db: Session, room: Room):
         latest_lot_by_player.setdefault(candidate.player_id, candidate)
     current_unsold = [candidate for candidate in latest_lot_by_player.values() if candidate.status == "UNSOLD"]
     return {
+        # Lets browsers correct their clock skew so every device shows the same countdown.
+        "server_time": iso_utc(now_utc()),
         "room": {"code": room.code, "name": room.name, "status": room.status,
                  "purse": room.purse, "timer_seconds": room.timer_seconds,
                  "min_squad": room.min_squad, "max_squad": room.max_squad,

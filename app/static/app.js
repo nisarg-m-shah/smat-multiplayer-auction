@@ -2,33 +2,17 @@ const $ = (id) => document.getElementById(id);
 let roomCode=null, token=null, isHost=false, myFranchise=null, ws=null, state=null, pool=[], timerInterval=null, lastSnapshot=null;
 let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null;
 let reconnectDelay=1000, reconnectTimer=null, heartbeatTimer=null;
+// Real-time sync state. `state` is the single source of truth in the browser; full snapshots replace
+// it, compact bid events patch it. Every message is ordered by the server's room version.
+let serverSkewMs=0, bidInFlight=false, armedBid=null, resyncing=false, bidFieldsVersion=0;
+window.__bidStats=[];
 const params=new URLSearchParams(location.search);
 roomCode=params.get("room"); token=params.get("token");
 const money=(n)=>Number(n||0).toLocaleString("en-IN");
 function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
-function displayMessage(value){
- if(typeof value==="string")return value;
- if(value&&typeof value==="object"){
-  if(typeof value.message==="string")return value.message;
-  if(typeof value.detail==="string")return value.detail;
-  if(typeof value.code==="string")return value.code.replaceAll("_"," ").toLowerCase();
-  try{return JSON.stringify(value)}catch(_){return "Request failed"}
- }
- return value==null?"Request failed":String(value);
-}
-async function api(path,opts={}){
- const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});
- const d=await r.json().catch(()=>({}));
- if(!r.ok){
-  const detail=d.detail;
-  const err=new Error(displayMessage(detail)||"Request failed");
-  err.status=r.status;err.detail=detail;err.code=detail&&typeof detail==="object"?detail.code:null;
-  throw err;
- }
- return d;
-}
+async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Request failed");return d}
 function show(id){$(id).classList.remove("hidden")} function hide(id){$(id).classList.add("hidden")}
-function message(value){$("bid-feedback").textContent=displayMessage(value)}
+function message(text){$("bid-feedback").textContent=text}
 async function init(){
  if(!roomCode||!token){show("landing");hide("room");return}
  hide("landing");show("room");$("room-code").textContent=roomCode;
@@ -51,7 +35,8 @@ async function render(s){
  // Concurrent bid responses can arrive out of order. Never let an older
  // committed room version overwrite a newer snapshot already rendered.
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
- state=s;lastSnapshot=s;
+ noteServerTime(s.server_time);
+ state=s;lastSnapshot=s;bidFieldsVersion=0;
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
@@ -94,27 +79,19 @@ async function render(s){
   const p=s.current_player;show("live-area");
   $("player-name").textContent=p.name;$("player-role").textContent=p.role;$("player-team").textContent=p.state_team;
   $("round-label").textContent="ROUND "+p.round_no;$("base-price").textContent=money(p.base_price);$("current-bid").textContent=money(p.current_bid||p.base_price);
-  $("leading").textContent=p.highest_franchise?"Leading: "+p.highest_franchise:"No bids yet";
-  $("next-bid").textContent=money(p.next_bid);
-  if(isHost&&!myFranchise){hide("bid-button");}else{show("bid-button");}
-  $("bid-button").disabled=!myFranchise||s.room.status!=="LIVE";
+  paintBid();
   startLocalTimer(p.ends_at);
  }else{
   $("player-name").textContent=s.room.status==="COMPLETED"?"Auction completed":"Waiting for next player";
   $("player-team").textContent="Players remaining: "+s.queue_remaining;$("timer").textContent="—";
-  $("bid-button").disabled=true;
+  updateBidButton();
  }
  // Squad information must refresh even between players, immediately after a sale.
  $("my-squad").innerHTML=myFranchise?((s.franchises.find(f=>f.id===myFranchise.id)?.squad||[]).map(x=>`${esc(x.player)} — ${money(x.price)}`).join("<br>")||"No players purchased yet"):"Administrator view — select a franchise invite to view its squad.";
  if(isHost){
   show("admin-controls");renderUnsold(s.unsold);
   const status=s.room.status;
-  const history=s.history||{};
-  const controls={pause:status!=="LIVE",resume:status!=="PAUSED",
-   "undo-bid":!history.can_undo_bid,"redo-bid":!history.can_redo_bid,
-   "undo-sale":!history.can_undo_sale,"redo-sale":!history.can_redo_sale,
-   finish:status==="COMPLETED"};
-  document.querySelectorAll("[data-action]").forEach(b=>b.disabled=!!controls[b.dataset.action]);
+  paintHostButtons(s);
   const warning=$("unsold-warning");
   if(warning)warning.textContent=`${s.queue_remaining||0} unseen players remain in the queue. Starting this unsold-only round will skip them and auction only the players you select. The current player, if any, will be settled first.`;
   const nominate=$("nominate");
@@ -122,6 +99,14 @@ async function render(s){
   const livePicker=$("host-franchise-live");
   if(livePicker){livePicker.innerHTML=hostFranchiseOptions(s);livePicker.value=s.room.host_franchise_id||"";}
  }
+}
+function paintHostButtons(s){
+ const status=s.room.status, history=s.history||{};
+ const controls={pause:status!=="LIVE",resume:status!=="PAUSED",
+  "undo-bid":!history.can_undo_bid,"redo-bid":!history.can_redo_bid,
+  "undo-sale":!history.can_undo_sale,"redo-sale":!history.can_redo_sale,
+  finish:status==="COMPLETED"};
+ document.querySelectorAll("[data-action]").forEach(b=>b.disabled=!!controls[b.dataset.action]);
 }
 function hostFranchiseOptions(s){
  return `<option value="">Host only — not bidding</option>`+(s.franchises||[]).map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("");
@@ -211,44 +196,93 @@ function startLocalTimer(endsAt){
  if(!endsAt){$("timer").textContent="PAUSED";return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);$("timer").textContent=sec.toFixed(1)+"s";};
+ const update=()=>{const sec=Math.max(0,(deadline-(Date.now()+serverSkewMs))/1000);$("timer").textContent=sec.toFixed(1)+"s";};
  update();timerInterval=setInterval(update,100);
 }
-function roomVersion(){return Number(state?.room?.version||0)}
-function applyBidUpdate(d){
- if(!state||!state.current_player||Number(d.lot_id)!==Number(state.current_player.lot_id)){
-  requestFullSnapshot("bid for unknown lot");return;
+// ---- real-time sync -------------------------------------------------------------------------
+const roomVersion=()=>Number(state?.room?.version??-1);
+function noteServerTime(t){const ms=t?Date.parse(t):NaN;if(!Number.isNaN(ms))serverSkewMs=ms-Date.now()}
+function applyIncoming(m){
+ if(!m||!m.type)return;
+ if(m.type==="snapshot"){
+  // Equal or older versions carry nothing new: ignoring them avoids rebuilding the whole page.
+  if(state&&Number(m.data?.room?.version??0)<=roomVersion())return;
+  return render(m.data);
  }
- const incoming=Number(d.room_version||0);
- if(incoming<=roomVersion())return;
- if(incoming!==roomVersion()+1){requestFullSnapshot("bid version gap");return;}
- state.room.version=incoming;
- const p=state.current_player;
- p.current_bid=Number(d.highest_bid);
- p.highest_franchise_id=Number(d.leading_franchise_id);
- p.highest_franchise=d.leading_franchise_name;
- p.next_bid=Number(d.next_bid_amount);
- p.ends_at=d.timer_deadline;
- $("current-bid").textContent=money(p.current_bid);
- $("leading").textContent="Leading: "+(p.highest_franchise||"No bids yet");
- $("next-bid").textContent=money(p.next_bid);
- startLocalTimer(p.ends_at);
- // Update only the live fields; don't rebuild squads on every bid.
- document.querySelectorAll("#franchises details").forEach(el=>el.classList.toggle("leading-team",Number(el.dataset.franchise)===p.highest_franchise_id));
- const activity=$("activity");
- const line=document.createElement("div");line.className="activity-item";
- line.textContent=`${d.leading_franchise_name} bid ${money(d.highest_bid)}.`;
- activity.prepend(line);while(activity.children.length>30)activity.lastElementChild.remove();
- if(isHost){const undo=$("undo-bid")||document.querySelector('[data-action="undo-bid"]');const redo=document.querySelector('[data-action="redo-bid"]');if(undo)undo.disabled=false;if(redo)redo.disabled=true;}
- if(myFranchise&&Number(myFranchise.id)===p.highest_franchise_id){$("bid-button").disabled=true;}
- else{$("bid-button").disabled=state.room.status!=="LIVE"||!myFranchise;}
+ if(m.type==="BID_ACCEPTED")return applyBidEvent(m);
 }
-let resyncInFlight=false;
-async function requestFullSnapshot(reason){
- if(resyncInFlight)return;resyncInFlight=true;
- try{const s=await api(`/api/rooms/${roomCode}/snapshot`);await render(s);}
- catch(e){console.warn("Snapshot recovery failed:",reason,e);}
- finally{resyncInFlight=false;}
+function patchBidFields(p,e){
+ p.current_bid=e.highest_bid;p.highest_franchise_id=e.leading_franchise_id;
+ p.highest_franchise=e.leading_franchise_name;p.next_bid=e.next_bid_amount;p.ends_at=e.timer_deadline;
+}
+function applyBidEvent(e){
+ const v=Number(e.room_version), have=roomVersion();
+ noteServerTime(e.server_time);
+ if(!state||!state.current_player){requestResync("no-state");return}
+ if(v<=have)return;                                   // duplicate or older than what we already show
+ const p=state.current_player;
+ if(v!==have+1||p.lot_id!==e.lot_id||state.room.status!=="LIVE"){requestResync("gap");return}   // missed something
+ if(v>=bidFieldsVersion){patchBidFields(p,e);bidFieldsVersion=v}
+ state.room.version=v;
+ (state.recent_bids=state.recent_bids||[]).push({franchise:e.leading_franchise_name,amount:e.highest_bid,sequence:e.bid_sequence});
+ state.history={...(state.history||{}),can_undo_bid:true,can_redo_bid:false};
+ if(e.event){state.events=[e.event,...(state.events||[])].slice(0,30);prependActivity(e.event)}
+ paintBid();startLocalTimer(p.ends_at);
+ if(isHost)paintHostButtons(state);
+}
+function applyRejectionState(st){
+ // A 409 carries the newest bid state. Show it immediately; the in-order WebSocket events that
+ // follow fill in the rest. If they never arrive (socket down) a resync fetches a full snapshot.
+ noteServerTime(st.server_time);
+ const v=Number(st.room_version);
+ if(!state||!state.current_player||v<=roomVersion())return;
+ const p=state.current_player;
+ if(st.lot_id!==p.lot_id||st.room_status!==state.room.status){requestResync("rejection");return}
+ if(v>=bidFieldsVersion){
+  patchBidFields(p,{highest_bid:st.highest_bid,leading_franchise_id:st.leading_franchise_id,
+   leading_franchise_name:st.leading_franchise_name,next_bid_amount:st.next_bid_amount,timer_deadline:st.timer_deadline});
+  bidFieldsVersion=v;
+  paintBid();startLocalTimer(p.ends_at);
+ }
+ setTimeout(()=>{if(roomVersion()<v)requestResync("hint-not-confirmed")},1500);
+}
+async function requestResync(reason,attempt=0){
+ if(resyncing&&attempt===0)return;            // one recovery at a time; later triggers coalesce
+ resyncing=true;
+ try{
+  const s=await api(`/api/rooms/${roomCode}/snapshot`);
+  noteServerTime(s.server_time);
+  if(!state||Number(s.room.version)>roomVersion())await render(s);
+  resyncing=false;
+ }catch(e){
+  console.warn("resync failed ("+reason+")",e);
+  if(attempt<5)setTimeout(()=>requestResync(reason,attempt+1),1500*(attempt+1));
+  else resyncing=false;
+ }
+}
+function paintBid(){
+ const p=state?.current_player;if(!p)return;
+ $("current-bid").textContent=money(p.current_bid||p.base_price);
+ $("leading").textContent=p.highest_franchise?"Leading: "+p.highest_franchise:"No bids yet";
+ $("next-bid").textContent=money(p.next_bid);
+ // Highlight the leader without rebuilding the franchise cards (keeps expanded squads open).
+ document.querySelectorAll("#franchises details[data-franchise]").forEach(el=>
+  el.classList.toggle("leading-team",Number(el.dataset.franchise)===Number(p.highest_franchise_id)));
+ updateBidButton();
+}
+function updateBidButton(){
+ const b=$("bid-button"),p=state?.current_player;
+ if(isHost&&!myFranchise){hide("bid-button");return}
+ show("bid-button");
+ const leading=!!(p&&myFranchise&&Number(p.highest_franchise_id)===Number(myFranchise.id));
+ b.disabled=!myFranchise||!p||state?.room?.status!=="LIVE"||bidInFlight||leading;
+}
+function prependActivity(e){
+ const box=$("activity");if(!box)return;
+ const placeholder=box.querySelector("p.muted");if(placeholder)placeholder.remove();
+ const div=document.createElement("div");div.className="activity-item";div.textContent=e.message;
+ box.prepend(div);
+ while(box.children.length>30)box.lastElementChild.remove();
 }
 function connect(){
  if(!roomCode||!token)return;
@@ -272,7 +306,7 @@ function connect(){
  };
  socket.onerror=()=>socket.close();
  socket.onmessage=(ev)=>{
-  try{const m=JSON.parse(ev.data);if(m.type==="snapshot")render(m.data);else if(m.type==="bid")applyBidUpdate(m.data)}catch(e){console.warn("Ignored malformed WebSocket message",e)}
+  try{applyIncoming(JSON.parse(ev.data))}catch(e){console.warn("Ignored malformed WebSocket message",e)}
  };
 }
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -283,7 +317,7 @@ $("create-form").addEventListener("submit",async e=>{
   const d=await fetch("/api/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
    name:fd.get("name"),franchises,purse:Number(fd.get("purse")),timer_seconds:Number(fd.get("timer_seconds")),
    min_squad:Number(fd.get("min_squad")),max_squad:Number(fd.get("max_squad")),bid_extension:fd.get("bid_extension")==="on"
-  })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(displayMessage(x.detail));return x});
+  })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(x.detail);return x});
   const base=location.origin;let html=`<h2>Room created: ${d.room_code}</h2><p>Save these links now. The raw invite tokens are only shown once.</p><p><b>Host link:</b> <a href="${base}${d.host_url}&host=1">${base}${d.host_url}&host=1</a></p><h3>Franchise invites</h3>`;
   d.franchise_invites.forEach(x=>html+=`<p><b>${esc(x.franchise)}:</b> <a href="${base}${x.url}">${base}${x.url}</a></p>`);
   html+=`<p>Players loaded: ${d.players_loaded}. Copy the host link and franchise links somewhere safe.</p>`;
@@ -292,38 +326,53 @@ $("create-form").addEventListener("submit",async e=>{
  }catch(err){alert(err.message)}
 });
 $("copy-link").onclick=()=>navigator.clipboard.writeText(location.href);
+// The amount sent is the price that was on the button when the user pressed it (pointerdown),
+// so a price that changes under their finger is rejected as stale instead of being bid blindly.
+$("bid-button").addEventListener("pointerdown",()=>{
+ const p=state?.current_player;
+ armedBid=p?{lot_id:p.lot_id,amount:p.next_bid,at:Date.now()}:null;
+});
 $("bid-button").onclick=async()=>{
- if(!state?.current_player||$("bid-button").disabled)return;
- const button=$("bid-button");
- // Capture the exact amount displayed at click time. Never auto-increase on stale state.
- const amount=Number(state.current_player.next_bid);
- button.disabled=true;message("Submitting bid of "+money(amount)+"…");
+ const p=state?.current_player;
+ if(!p||$("bid-button").disabled||bidInFlight||!myFranchise)return;
+ const armed=armedBid&&armedBid.lot_id===p.lot_id&&Date.now()-armedBid.at<5000?armedBid:null;
+ armedBid=null;
+ const amount=armed?armed.amount:p.next_bid;
+ const requestId=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random().toString(16).slice(2)).replace(/-/g,"").slice(0,16);
+ bidInFlight=true;updateBidButton();message("Submitting bid…");
+ const t0=performance.now();
  try{
-  const d=await api(`/api/rooms/${roomCode}/bid`,{method:"POST",body:JSON.stringify({amount})});
-  applyBidUpdate(d);message("Bid accepted: "+money(d.highest_bid));
+  const r=await fetch(`/api/rooms/${roomCode}/bid`,{method:"POST",headers:{...auth(),"X-Request-Id":requestId},
+   body:JSON.stringify({amount,lot_id:p.lot_id,franchise_id:myFranchise.id})});
+  const d=await r.json().catch(()=>({}));
+  const ms=Math.round(performance.now()-t0);
+  window.__bidStats.push({request_id:requestId,amount,status:r.status,code:d.code||null,ack_ms:ms});
+  console.info("bid",requestId,r.status,d.code||"accepted",ms+" ms");
+  if(r.ok){applyIncoming(d);message(`Bid accepted: ${money(d.highest_bid)} · ${ms} ms`)}
+  else{
+   if(d.state)applyRejectionState(d.state);
+   message(rejectionText(d));
+   // The outcome of a failed request may be unknown (e.g. 503): confirm against the server.
+   if(r.status>=500)requestResync("bid-error");
+  }
  }catch(e){
-  if(e.status===409&&e.detail){
-   const x=e.detail;
-   if(state?.current_player&&Number(x.lot_id)===Number(state.current_player.lot_id)){
-    // The rejection includes the latest authoritative state; display it without
-    // submitting a second bid. The participant must consciously click again.
-    if(Number(x.room_version)>=roomVersion()){
-     state.room.version=Number(x.room_version||roomVersion());
-     state.current_player.current_bid=Number(x.current_bid||0);
-     state.current_player.highest_franchise=x.leading_franchise||null;
-     state.current_player.highest_franchise_id=x.leading_franchise_id==null?null:Number(x.leading_franchise_id);
-     state.current_player.next_bid=Number(x.next_bid||state.current_player.next_bid);
-     $("current-bid").textContent=money(state.current_player.current_bid);
-     $("leading").textContent=x.leading_franchise?"Leading: "+x.leading_franchise:"No bids yet";
-     $("next-bid").textContent=money(state.current_player.next_bid);
-     if(x.timer_deadline){state.current_player.ends_at=x.timer_deadline;startLocalTimer(x.timer_deadline);}
-    }
-   }else{requestFullSnapshot("bid rejected");}
-   message(x.message||e.message);
-  }else{message(e.message);}
-  button.disabled=!(state?.room?.status==="LIVE"&&myFranchise&&state.current_player?.highest_franchise_id!==myFranchise.id);
- }
+  window.__bidStats.push({request_id:requestId,amount,status:0,code:"NETWORK",ack_ms:Math.round(performance.now()-t0)});
+  message("Could not reach the server — your bid was not confirmed. Checking the latest price…");
+  requestResync("bid-network");
+ }finally{bidInFlight=false;updateBidButton()}
 };
+function rejectionText(d){
+ const st=d.state||{};
+ const lead=st.leading_franchise_name?`${st.leading_franchise_name} leads at ${money(st.highest_bid)}`:"";
+ switch(d.code){
+  case "STALE_BID":return `Too slow — the price moved. ${lead?lead+". ":""}${st.next_bid_amount?"Next bid is "+money(st.next_bid_amount)+".":""} Bid again if you still want him.`;
+  case "ALREADY_HIGHEST_BIDDER":return "You are already the highest bidder.";
+  case "INSUFFICIENT_PURSE":return d.detail||"Insufficient purse for this bid.";
+  case "PLAYER_ALREADY_SETTLED":return "That player has already been settled.";
+  case "TIMER_EXPIRED":return "Time is up for this player.";
+  default:return d.detail||"Bid rejected";
+ }
+}
 $("start-auction").onclick=async()=>{if(!confirm("Lock the player pool and start the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/start`,{method:"POST"});render(d);show("live-area");hide("host-setup");}catch(e){alert(e.message)}};
 document.querySelectorAll("[data-action]").forEach(b=>b.onclick=async()=>{const action=b.dataset.action;if(action==="finish"&&!confirm("End the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/host/${action}`,{method:"POST"});render(d)}catch(e){alert(e.message)}});
 async function loadPool(){pool=await api(`/api/rooms/${roomCode}/pool`);renderPool()}
@@ -347,7 +396,7 @@ async function updateHostFranchise(value){
 }
 $("host-franchise-setup").onchange=e=>updateHostFranchise(e.target.value);
 $("add-player").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api(`/api/rooms/${roomCode}/players`,{method:"POST",body:JSON.stringify(Object.fromEntries(f))});e.target.reset();await loadPool()}catch(err){alert(err.message)}};
-$("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(displayMessage(d.detail));alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
+$("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(d.detail);alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
 function renderUnsold(list){$("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label><input type="checkbox" value="${p.player_id}"> ${esc(p.name)} (${esc(p.role)}) — base ${money(p.base_price)}</label><input class="small-input" type="number" min="1" data-unsold-price="${p.player_id}" placeholder="Keep ${p.base_price}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
 $("nominate").onclick=async()=>{
  const ids=[...$("unsold-list").querySelectorAll('input[type="checkbox"]:checked')].map(x=>Number(x.value));
