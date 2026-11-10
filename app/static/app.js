@@ -62,11 +62,11 @@ async function render(s){
   const squad=f.squad||[];
   const expanded=own||expandedFranchises.has(String(f.id));
   return `<details data-franchise="${f.id}" class="franchise ${s.current_player&&s.current_player.highest_franchise_id===f.id?"leading-team":""}" ${expanded?"open":""}>
-   <summary><strong>${esc(f.name)}${own?" · MY TEAM":""}</strong><div class="meta">Purse: ${money(f.purse_remaining)} · Squad: ${f.squad_count}/${s.room.max_squad} <span class="expand-hint">Click to view squad</span></div></summary>
+   <summary><span class="fr-avatar" style="--hue:${hueFor(f.name)}">${esc(initials(f.name))}</span><div class="fr-text"><strong>${esc(f.name)}${own?" · MY TEAM":""}</strong><div class="meta">Purse: ${money(f.purse_remaining)} · Squad: ${f.squad_count}/${s.room.max_squad} <span class="expand-hint">Click to view squad</span></div></div></summary>
    <div class="franchise-squad">${squad.length?`<table><thead><tr><th>Player</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map(x=>`<tr><td>${esc(x.player)}</td><td>${esc(x.role||"—")}</td><td>${money(x.price)}</td></tr>`).join("")}</tbody></table>`:`<span class="muted">No players purchased yet.</span>`}</div>
   </details>`;
  }).join("");
- $("activity").innerHTML=s.events.map(e=>`<div class="activity-item">${esc(e.message)}</div>`).join("")||'<p class="muted">No activity yet.</p>';
+ $("activity").innerHTML=s.events.map(e=>`<div class="activity-item kind-${String(e.kind||"").replace(/[^A-Z_]/g,"")}">${esc(e.message)}</div>`).join("")||'<p class="muted">No activity yet.</p>';
  if(s.room.status === "COMPLETED"){
   hide("live-area");hide("host-setup");hide("admin-controls");show("final-results");
   renderFinalResults(s);
@@ -190,12 +190,15 @@ function playCelebrationSound(sold){
     });
   }catch(e){/* Audio is optional; visual celebration still works. */}
 }
+function initials(name){const w=String(name||"").trim().split(/\s+/).filter(Boolean);return (w.length>1?w[0][0]+w[1][0]:String(name||"?").slice(0,2)).toUpperCase();}
+function hueFor(name){let h=0;for(const c of String(name||""))h=(h*31+c.charCodeAt(0))%360;return h;}
+function paintTimer(sec){const t=$("timer"),fill=$("timer-fill"),total=Number(state?.room?.timer_seconds)||10;t.textContent=sec.toFixed(1)+"s";t.classList.toggle("urgent",sec>0&&sec<=3);if(fill){fill.style.width=Math.max(0,Math.min(100,sec/total*100))+"%";fill.classList.toggle("urgent",sec>0&&sec<=3);}}
 function startLocalTimer(endsAt){
  clearInterval(timerInterval);
- if(!endsAt){$("timer").textContent="PAUSED";return}
+ if(!endsAt){$("timer").textContent="PAUSED";const fill=$("timer-fill");if(fill)fill.style.width="0%";return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);$("timer").textContent=sec.toFixed(1)+"s";};
+ const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);paintTimer(sec);};
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
@@ -296,7 +299,7 @@ function updateBidButton(){
 function prependActivity(e){
  const box=$("activity");if(!box)return;
  const placeholder=box.querySelector("p.muted");if(placeholder)placeholder.remove();
- const div=document.createElement("div");div.className="activity-item";div.textContent=e.message;
+ const div=document.createElement("div");div.className="activity-item kind-"+String(e.kind||"").replace(/[^A-Z_]/g,"");div.textContent=e.message;
  box.prepend(div);
  while(box.children.length>30)box.lastElementChild.remove();
 }
