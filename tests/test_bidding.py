@@ -394,3 +394,15 @@ def test_pg_database_guard_stops_double_accept_even_without_the_process_lock(cli
         res = _race(a, ["MI", "CSK", "RCB"], 100)
     assert sorted(r.status_code for r in res.values()) == [200, 409, 409], {k: (v.status_code, v.text) for k, v in res.items()}
     assert a.count(Bid) == 1 and a.db_lot()[1].bid_sequence == 1
+
+
+def test_index_assets_are_content_stamped_and_never_cached(client):
+    """Regression for the live-test failure: browsers kept an old app.js after a deploy."""
+    import re
+    r = client.get("/")
+    assert r.headers["cache-control"].startswith("no-store")
+    refs = re.findall(r'/static/(?:app\.js|style\.css)\?v=([0-9a-f]{10})', r.text)
+    assert len(refs) == 2
+    js = client.get(re.search(r'/static/app\.js\?v=[0-9a-f]{10}', r.text).group(0))
+    assert js.status_code == 200 and js.headers["cache-control"] == "no-cache"
+    assert "BID_ACCEPTED" in js.text          # the page really is the new frontend

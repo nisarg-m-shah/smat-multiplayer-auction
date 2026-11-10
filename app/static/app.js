@@ -4,7 +4,7 @@ let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null;
 let reconnectDelay=1000, reconnectTimer=null, heartbeatTimer=null;
 // Real-time sync state. `state` is the single source of truth in the browser; full snapshots replace
 // it, compact bid events patch it. Every message is ordered by the server's room version.
-let serverSkewMs=0, bidInFlight=false, armedBid=null, resyncing=false, bidFieldsVersion=0;
+let bidInFlight=false, armedBid=null, resyncing=false, bidFieldsVersion=0;
 window.__bidStats=[];
 const params=new URLSearchParams(location.search);
 roomCode=params.get("room"); token=params.get("token");
@@ -35,7 +35,6 @@ async function render(s){
  // Concurrent bid responses can arrive out of order. Never let an older
  // committed room version overwrite a newer snapshot already rendered.
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
- noteServerTime(s.server_time);
  state=s;lastSnapshot=s;bidFieldsVersion=0;
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
@@ -196,12 +195,11 @@ function startLocalTimer(endsAt){
  if(!endsAt){$("timer").textContent="PAUSED";return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>{const sec=Math.max(0,(deadline-(Date.now()+serverSkewMs))/1000);$("timer").textContent=sec.toFixed(1)+"s";};
+ const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);$("timer").textContent=sec.toFixed(1)+"s";};
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
 const roomVersion=()=>Number(state?.room?.version??-1);
-function noteServerTime(t){const ms=t?Date.parse(t):NaN;if(!Number.isNaN(ms))serverSkewMs=ms-Date.now()}
 function applyIncoming(m){
  if(!m||!m.type)return;
  if(m.type==="snapshot"){
@@ -215,25 +213,39 @@ function patchBidFields(p,e){
  p.current_bid=e.highest_bid;p.highest_franchise_id=e.leading_franchise_id;
  p.highest_franchise=e.leading_franchise_name;p.next_bid=e.next_bid_amount;p.ends_at=e.timer_deadline;
 }
+// Events normally arrive in order, but the bidder's own HTTP confirmation can overtake the WebSocket
+// event for the previous bid. Hold early events briefly and apply them in order; only a version that
+// is still missing after GAP_WAIT_MS triggers the (expensive) full-snapshot recovery.
+const GAP_WAIT_MS=1500, pendingEvents=new Map();let gapTimer=null;
 function applyBidEvent(e){
  const v=Number(e.room_version), have=roomVersion();
- noteServerTime(e.server_time);
  if(!state||!state.current_player){requestResync("no-state");return}
  if(v<=have)return;                                   // duplicate or older than what we already show
+ if(v!==have+1){pendingEvents.set(v,e);armGapTimer();return}
+ if(!applyContiguousBid(e))return;
+ for(;;){const nxt=pendingEvents.get(roomVersion()+1);if(!nxt)break;pendingEvents.delete(roomVersion()+1);if(!applyContiguousBid(nxt))return}
+ for(const k of [...pendingEvents.keys()])if(k<=roomVersion())pendingEvents.delete(k);
+ if(!pendingEvents.size&&gapTimer){clearTimeout(gapTimer);gapTimer=null}
+}
+function armGapTimer(){
+ if(gapTimer)return;
+ gapTimer=setTimeout(()=>{gapTimer=null;if(pendingEvents.size){pendingEvents.clear();requestResync("gap")}},GAP_WAIT_MS);
+}
+function applyContiguousBid(e){
  const p=state.current_player;
- if(v!==have+1||p.lot_id!==e.lot_id||state.room.status!=="LIVE"){requestResync("gap");return}   // missed something
- if(v>=bidFieldsVersion){patchBidFields(p,e);bidFieldsVersion=v}
- state.room.version=v;
+ if(p.lot_id!==e.lot_id||state.room.status!=="LIVE"){pendingEvents.clear();requestResync("lot-changed");return false}
+ if(Number(e.room_version)>=bidFieldsVersion){patchBidFields(p,e);bidFieldsVersion=Number(e.room_version)}
+ state.room.version=Number(e.room_version);
  (state.recent_bids=state.recent_bids||[]).push({franchise:e.leading_franchise_name,amount:e.highest_bid,sequence:e.bid_sequence});
  state.history={...(state.history||{}),can_undo_bid:true,can_redo_bid:false};
  if(e.event){state.events=[e.event,...(state.events||[])].slice(0,30);prependActivity(e.event)}
  paintBid();startLocalTimer(p.ends_at);
  if(isHost)paintHostButtons(state);
+ return true;
 }
 function applyRejectionState(st){
  // A 409 carries the newest bid state. Show it immediately; the in-order WebSocket events that
  // follow fill in the rest. If they never arrive (socket down) a resync fetches a full snapshot.
- noteServerTime(st.server_time);
  const v=Number(st.room_version);
  if(!state||!state.current_player||v<=roomVersion())return;
  const p=state.current_player;
@@ -244,14 +256,18 @@ function applyRejectionState(st){
   bidFieldsVersion=v;
   paintBid();startLocalTimer(p.ends_at);
  }
- setTimeout(()=>{if(roomVersion()<v)requestResync("hint-not-confirmed")},1500);
+ setTimeout(()=>{if(roomVersion()<v)requestResync("hint-not-confirmed")},3000);
 }
+let lastResyncAt=0, resyncQueued=false;
 async function requestResync(reason,attempt=0){
- if(resyncing&&attempt===0)return;            // one recovery at a time; later triggers coalesce
- resyncing=true;
+ if(attempt===0){
+  if(resyncing||resyncQueued)return;                    // one recovery at a time; later triggers coalesce
+  const wait=lastResyncAt+3000-Date.now();              // at most one full snapshot per 3 s per browser
+  if(wait>0){resyncQueued=true;setTimeout(()=>{resyncQueued=false;requestResync(reason)},wait);return}
+ }
+ resyncing=true;lastResyncAt=Date.now();
  try{
   const s=await api(`/api/rooms/${roomCode}/snapshot`);
-  noteServerTime(s.server_time);
   if(!state||Number(s.room.version)>roomVersion())await render(s);
   resyncing=false;
  }catch(e){
@@ -351,7 +367,7 @@ $("bid-button").onclick=async()=>{
   if(r.ok){applyIncoming(d);message(`Bid accepted: ${money(d.highest_bid)} · ${ms} ms`)}
   else{
    if(d.state)applyRejectionState(d.state);
-   message(rejectionText(d));
+   message(rejectionText(d)+` [${r.status} ${d.code||"error"}${d.request_id?" "+d.request_id:""}]`);
    // The outcome of a failed request may be unknown (e.g. 503): confirm against the server.
    if(r.status>=500)requestResync("bid-error");
   }

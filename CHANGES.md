@@ -30,7 +30,7 @@ Unchanged: models/schema, seed, config, security, render.yaml, existing tests (a
 * **No schema change, no migration.** `.env` untouched.
 * Deploy as usual (push → Render auto-deploy). Keep **1 worker, 1 instance**. Don't deploy mid-auction (see limitations).
 * Optional env vars (all have safe defaults): `BID_FUSED_WRITE=0` (fall back to 4 separate write statements), `DB_POOL_PRE_PING=0` (saves ~75 ms/request but risks an error on the first bid after an idle disconnect — only after measuring), `BID_TRACE_SQL=1` (per-statement timings in `bid_timing`).
-* Browsers with the old `app.js` cached would send no `amount` → 422; the `?v=3` query string forces a refresh. Ask everyone to reload once.
+* The server now stamps `app.js`/`style.css` URLs in `index.html` with a hash of their content and serves static files with `Cache-Control: no-cache`, so a deploy can never leave browsers on an old frontend. Everyone must reload the page once after deploying.
 
 ## Tests (run: `pip install pytest httpx && pytest`; JS tests need `cd tests/js && npm install`)
 Existing 9 tests: pass, untouched. New: A normal, B stale, C concurrent (2- and 3-way, with slowed commits), D same-franchise, E purse (+min-squad reserve), F timer (expired, settled, settle-vs-in-flight-bid, re-arm), G three WS clients + no snapshot after bid, H out-of-order/duplicate/stale (JS, jsdom), I reconnect (server + client gap recovery), J DB failure before/at commit, K regression; plus auth/identity, player-pinning, undo→rebid branch, no-snapshot-on-bid-path, log fields/no secrets, slow/dead WS client isolation.
@@ -51,3 +51,11 @@ Expect roughly this if your real RTT is ~75 ms; **confirm in your Render logs** 
 * Broadcast timing is server-side; client-side delivery adds network latency (~one-way RTT).
 * Version numbers assume the DB is never restored to an older state while browsers are open.
 * The fused PostgreSQL statement was tested on PG 16 locally, not on Supabase; use `BID_FUSED_WRITE=0` if it ever misbehaves.
+
+## Update 2 (after live-test report: few bids accepted, timers out of step)
+* Not reproduced locally (10 real browsers, 75 ms injected DB latency: clients stayed in sync, timers within ~0.2 s). Likely cause found by review: an early event (e.g. the bidder's own HTTP ack overtaking the WebSocket event for the previous bid) made the browser fetch a full snapshot; with many phones and a large pool that can flood the server and DB pool. Now early events are held up to 1.5 s and applied in order; recovery snapshots are limited to one per 3 s per browser.
+* Removed the server-clock timer correction (timers use device clock vs `ends_at`, exactly as your original).
+* Rejection messages now end with `[status CODE request_id]` so a failure can be diagnosed from a screenshot; match `request_id` to the Render `bid_timing` line (`reason=`).
+
+## Update 3 (root cause of the live-test failure, from your Render logs)
+Server side was healthy: accepted bids `total_ms` ≈ 365–393 ms, `db_stmts=3`, broadcast ≈ 1 ms. The failures were caused by browsers still running the OLD cached `app.js` (your page loaded `app.js?v=dd69e53-fix1`; my `?v=3` edit never matched your index.html, and no `/static/app.js` request appears after the redeploy). The old frontend ignores `BID_ACCEPTED` events, so other clients kept showing the old price, bid it again, got `STALE_BID`, and only then fetched a snapshot. Fixed by server-side content-hash stamping (above). If you merged files by hand, keep `index.html` from this zip or leave it as is: the server rewrites the asset URLs either way.

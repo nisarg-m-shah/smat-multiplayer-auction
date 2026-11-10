@@ -40,7 +40,15 @@ logger = logging.getLogger("smat-auction")
 
 app = FastAPI(title="SMAT Private Auction", version="1.0.0")
 STATIC = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+class RevalidatingStatic(StaticFiles):
+    """Static files are always revalidated (ETag/304) so a redeploy can never leave browsers on an old
+    app.js that does not understand the server's messages."""
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+app.mount("/static", RevalidatingStatic(directory=STATIC), name="static")
 
 class CreateRoom(BaseModel):
     name: str = "SMAT Auction"
@@ -349,9 +357,23 @@ async def recover_live_rooms():
     with SessionLocal() as db:
         recover_interrupted_rooms(db)
 
+_ASSET_REF = re.compile(r'(/static/(?:app\.js|style\.css))(\?v=[^"\']*)?')
+
+def _index_html():
+    """index.html with every app.js/style.css reference stamped with a hash of the file's CONTENT,
+    whatever query string the HTML had. Any change to the files changes the URL, so browsers cannot
+    keep running a stale frontend after a deploy."""
+    import hashlib
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    def stamp(m):
+        f = STATIC / m.group(1).split("/static/")[1]
+        digest = hashlib.sha1(f.read_bytes()).hexdigest()[:10] if f.exists() else "0"
+        return f"{m.group(1)}?v={digest}"
+    return _ASSET_REF.sub(stamp, html)
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store, max-age=0"})
+    return HTMLResponse(_index_html(), headers={"Cache-Control": "no-store, max-age=0"})
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):

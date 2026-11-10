@@ -79,25 +79,20 @@ test("H: duplicate / older events are ignored and never revert newer state", asy
   assert.strictEqual($("current-bid").textContent, "110");
 });
 
-test("H: out-of-order delivery (v+2 before v+1) triggers one recovery and ends on the newest state", async () => {
-  const { w, $, ev, calls } = await boot();
-  const newest = JSON.parse(JSON.stringify(fx.snapshot));
-  newest.room.version = v0 + 2;
-  newest.current_player.current_bid = 110; newest.current_player.highest_franchise_id = me.id;
-  newest.current_player.highest_franchise = me.name; newest.current_player.next_bid = 120;
-  w.__nextSnapshot = newest;
-  ev(mkBid(v0 + 2, 110, me.name, me.id));                    // arrives first: gap -> resync
-  ev(mkBid(v0 + 2, 110, me.name, me.id));                    // coalesced, no second fetch
-  ev(mkBid(v0 + 1, 100, other.name, other.id));              // the late one
-  await sleep(100);
-  assert.strictEqual(calls.filter((c) => c.url.endsWith("/snapshot")).length, 2);
+test("H: out-of-order delivery (v+2 before v+1) is reordered locally with NO snapshot fetch", async () => {
+  const { $, ev, calls } = await boot();
+  ev(mkBid(v0 + 2, 110, me.name, me.id));                    // e.g. my HTTP ack overtakes the WebSocket event
+  assert.strictEqual($("current-bid").textContent, String(cp0.current_bid || cp0.base_price), "must wait for v+1, not show v+2 yet");
+  ev(mkBid(v0 + 2, 110, me.name, me.id));                    // duplicate
+  ev(mkBid(v0 + 1, 100, other.name, other.id));              // the missing one arrives
   assert.strictEqual($("current-bid").textContent, "110");
-  assert.strictEqual($("next-bid").textContent, "120");
-  ev(mkBid(v0 + 3, 120, other.name, other.id));              // v+3 applies cleanly => local version is v+2
+  assert.ok($("leading").textContent.includes(me.name));
+  ev(mkBid(v0 + 1, 100, other.name, other.id));              // late duplicate never reverts
+  assert.strictEqual($("current-bid").textContent, "110");
+  ev(mkBid(v0 + 3, 120, other.name, other.id));              // v+3 applies => local version was v+2
   assert.strictEqual($("current-bid").textContent, "120");
-  assert.strictEqual(calls.filter((c) => c.url.endsWith("/snapshot")).length, 2, "no further recovery needed");
-  ev(mkBid(v0 + 1, 100, other.name, other.id));              // still ignored afterwards
-  assert.strictEqual($("current-bid").textContent, "120");
+  await sleep(1700);
+  assert.strictEqual(calls.filter((c) => c.url.endsWith("/snapshot")).length, 1, "no recovery snapshot was needed");
 });
 
 test("I: a missed event (version gap) is repaired with a full snapshot", async () => {
@@ -107,7 +102,7 @@ test("I: a missed event (version gap) is repaired with a full snapshot", async (
   newest.current_player.highest_franchise = other.name; newest.current_player.highest_franchise_id = other.id;
   w.__nextSnapshot = newest;
   ev(mkBid(v0 + 5, 150, other.name, other.id));
-  await sleep(100);
+  await sleep(1900);                                          // waits for the missing versions, then recovers
   assert.strictEqual($("current-bid").textContent, "150");
   assert.strictEqual(calls.filter((c) => c.url.endsWith("/snapshot")).length, 2);
 });
