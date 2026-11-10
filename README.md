@@ -6,13 +6,18 @@ A first working version of a private auction room for 2–10 custom franchises. 
 
 - Host creates a private room and names 2–10 franchises.
 - One private invite link per franchise; no public sign-up.
+- Franchise-name + private-password login. The password is the high-entropy private invite token; only its hash is stored server-side.
+- Browser sessions persist in local storage for that room, and the token is removed from the address bar after login.
+- The visible room code is omitted from the interface; the private room identifier remains in the URL so a saved session can reconnect.
 - Player pool is seeded from the `squads` literal in your copied `Auction.py`.
 - Host can include/exclude players, change base price and importance weight, add players, and import a CSV before the auction.
 - Live auction with server-side bid validation and WebSocket updates.
 - Configurable purse, timer (5/10/25 seconds), minimum squad and maximum squad.
 - Bid increments: +10 while current bid is below 200; +20 from 200 to below 500; +25 from 500 onward.
 - Bid timer extension: adds half the configured timer to the remaining time, capped at one full timer window.
-- Host controls: pause, resume, settle/advance, undo latest bid, undo latest sale, finish auction.
+- Host controls: pause, resume, settle/advance, undo latest bid, undo latest sale, finish auction. Controls sit directly above the live bidding panel.
+- Sold/unsold result banners finish before the next player is revealed.
+- Undoing a settled sale after the next player has opened reopens the previous player at the last accepted bid, parks the next player with its bid state and remaining timer, and restores that next player after the reopened lot is settled.
 - Unsold players can be nominated by the host for a later round at the same base price; the backend accepts optional price overrides.
 - Weighted random player order. Importance weight 1.0 is ordinary chance; higher values make the player more likely to appear earlier.
 - SQLite for local use; PostgreSQL supported through `DATABASE_URL`.
@@ -30,7 +35,7 @@ The current v1 deliberately does not include:
 - Automatic AI player importance ratings.
 - Multiple simultaneous rooms per account.
 
-The host invite is a bearer secret. Anyone who has the host link can control the room. Share it privately and keep it out of public chats.
+The franchise and host passwords are bearer secrets (the private invite tokens). Anyone who has one can access that franchise or host session. Share credentials privately. Browser sessions are stored in local storage on that device; clear the browser's site data to sign out. The room code is still present in the URL, but is not displayed as a room-code label in the interface.
 
 ## 1. Local setup
 

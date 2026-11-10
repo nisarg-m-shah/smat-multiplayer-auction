@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 let roomCode=null, token=null, isHost=false, myFranchise=null, ws=null, state=null, pool=[], timerInterval=null, lastSnapshot=null;
-let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null;
+let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null, celebrationChain=Promise.resolve();
 let reconnectDelay=1000, reconnectTimer=null, heartbeatTimer=null;
 // Real-time sync state. `state` is the single source of truth in the browser; full snapshots replace
 // it, compact bid events patch it. Every message is ordered by the server's room version.
@@ -8,14 +8,18 @@ let bidInFlight=false, armedBid=null, resyncing=false, bidFieldsVersion=0;
 window.__bidStats=[];
 const params=new URLSearchParams(location.search);
 roomCode=params.get("room"); token=params.get("token");
+if(roomCode && !token) token=localStorage.getItem(`smat-session:${roomCode}`);
+if(roomCode && token){localStorage.setItem(`smat-session:${roomCode}`,token);history.replaceState({},"",`/?room=${encodeURIComponent(roomCode)}`)}
 const money=(n)=>Number(n||0).toLocaleString("en-IN");
 function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
 async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Request failed");return d}
 function show(id){$(id).classList.remove("hidden")} function hide(id){$(id).classList.add("hidden")}
 function message(text){$("bid-feedback").textContent=text}
 async function init(){
- if(!roomCode||!token){show("landing");hide("room");return}
- hide("landing");show("room");$("room-code").textContent=roomCode;
+ if(!roomCode){show("landing");hide("room");hide("login-panel");return}
+ hide("landing");show("room");
+ if(!token){show("login-panel");hide("room");return}
+ hide("login-panel");
  try{
    const me=await api(`/api/rooms/${roomCode}/me`);
    const snap=await api(`/api/rooms/${roomCode}/snapshot`);
@@ -29,32 +33,31 @@ async function init(){
    else if(myFranchise){show("live-area")}
    else {show("live-area");$("bid-button").disabled=true;message("Open your franchise-specific invite link to enable bidding.")}
    await render(snap); connect();
- }catch(e){alert(e.message);location.href="/"}
+ }catch(e){localStorage.removeItem(`smat-session:${roomCode}`);token=null;hide("room");show("login-panel");$("login-error").textContent=e.message;}
 }
 async function render(s){
- // Concurrent bid responses can arrive out of order. Never let an older
- // committed room version overwrite a newer snapshot already rendered.
+ // Do not reveal the next player underneath a sold/unsold banner. Hold the incoming
+ // snapshot until the result animation has completed, then apply the latest snapshot.
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
+ const incomingEvents=Array.isArray(s.events)?s.events:[];
+ const newResult=incomingEvents.filter(e=>(Number(e.id)||0)>lastCelebrationEventId && (e.kind==="SOLD"||e.kind==="UNSOLD"))
+   .sort((a,b)=>(Number(a.id)||0)-(Number(b.id)||0));
+ if(hasInitialSnapshot && newResult.length){
+   const resultEvent=newResult[newResult.length-1];
+   lastCelebrationEventId=Number(resultEvent.id)||lastCelebrationEventId;
+   celebrationChain=celebrationChain.then(()=>celebrate(resultEvent));
+   await celebrationChain;
+   if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
+ }
  state=s;lastSnapshot=s;bidFieldsVersion=0;
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
  }
- // The server sends the latest events in descending ID order. Establish a
- // baseline on the first snapshot so joining/reloading does not replay old
- // auction results; on later snapshots, celebrate each newly-created result.
- const snapshotEvents=Array.isArray(s.events)?s.events:[];
- const newestEventId=snapshotEvents.reduce((max,e)=>Math.max(max,Number(e.id)||0),0);
- if(!hasInitialSnapshot){
-  lastCelebrationEventId=newestEventId;
-  hasInitialSnapshot=true;
- }else{
-  const newResults=snapshotEvents
-   .filter(e=>(Number(e.id)||0)>lastCelebrationEventId && (e.kind==="SOLD"||e.kind==="UNSOLD"))
-   .sort((a,b)=>(Number(a.id)||0)-(Number(b.id)||0));
-  if(newResults.length)celebrate(newResults[newResults.length-1]);
-  lastCelebrationEventId=Math.max(lastCelebrationEventId||0,newestEventId);
- }
+ // Establish a baseline on the first snapshot; old results should not replay on join/reload.
+ const newestEventId=(s.events||[]).reduce((max,e)=>Math.max(max,Number(e.id)||0),0);
+ if(!hasInitialSnapshot){lastCelebrationEventId=newestEventId;hasInitialSnapshot=true;}
+ else lastCelebrationEventId=Math.max(lastCelebrationEventId||0,newestEventId);
  $("connection").textContent=ws&&ws.readyState===1?"Connected":"Connecting…";
  const expandedFranchises=new Set([...document.querySelectorAll("#franchises details[open]")].map(el=>String(el.dataset.franchise)));
  $("franchises").innerHTML=s.franchises.map(f=>{
@@ -62,11 +65,11 @@ async function render(s){
   const squad=f.squad||[];
   const expanded=own||expandedFranchises.has(String(f.id));
   return `<details data-franchise="${f.id}" class="franchise ${s.current_player&&s.current_player.highest_franchise_id===f.id?"leading-team":""}" ${expanded?"open":""}>
-   <summary><strong>${esc(f.name)}${own?" · MY TEAM":""}</strong><div class="meta">Purse: ${money(f.purse_remaining)} · Squad: ${f.squad_count}/${s.room.max_squad} <span class="expand-hint">Click to view squad</span></div></summary>
+   <summary><span class="fr-avatar" style="--hue:${hueFor(f.name)}">${esc(initials(f.name))}</span><div class="fr-text"><strong>${esc(f.name)}${own?" · MY TEAM":""}</strong><div class="meta">Purse: ${money(f.purse_remaining)} · Squad: ${f.squad_count}/${s.room.max_squad} <span class="expand-hint">Click to view squad</span></div></div></summary>
    <div class="franchise-squad">${squad.length?`<table><thead><tr><th>Player</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map(x=>`<tr><td>${esc(x.player)}</td><td>${esc(x.role||"—")}</td><td>${money(x.price)}</td></tr>`).join("")}</tbody></table>`:`<span class="muted">No players purchased yet.</span>`}</div>
   </details>`;
  }).join("");
- $("activity").innerHTML=s.events.map(e=>`<div class="activity-item">${esc(e.message)}</div>`).join("")||'<p class="muted">No activity yet.</p>';
+ $("activity").innerHTML=s.events.map(e=>`<div class="activity-item kind-${String(e.kind||"").replace(/[^A-Z_]/g,"")}">${esc(e.message)}</div>`).join("")||'<p class="muted">No activity yet.</p>';
  if(s.room.status === "COMPLETED"){
   hide("live-area");hide("host-setup");hide("admin-controls");show("final-results");
   renderFinalResults(s);
@@ -160,7 +163,11 @@ function celebrate(event){
   root.classList.toggle("unsold-celebration",!sold);
   playCelebrationSound(sold);
   clearTimeout(root._hideTimer);
-  root._hideTimer=setTimeout(()=>root.classList.add("hidden"),sold?4800:3600);
+  const duration=sold?4800:3600;
+  return new Promise(resolve=>{
+    clearTimeout(root._hideTimer);
+    root._hideTimer=setTimeout(()=>{root.classList.add("hidden");resolve();},duration);
+  });
 }
 function prepareCelebrationAudio(){
   try{
@@ -190,12 +197,15 @@ function playCelebrationSound(sold){
     });
   }catch(e){/* Audio is optional; visual celebration still works. */}
 }
+function initials(name){const w=String(name||"").trim().split(/\s+/).filter(Boolean);return (w.length>1?w[0][0]+w[1][0]:String(name||"?").slice(0,2)).toUpperCase();}
+function hueFor(name){let h=0;for(const c of String(name||""))h=(h*31+c.charCodeAt(0))%360;return h;}
+function paintTimer(sec){const t=$("timer"),fill=$("timer-fill"),total=Number(state?.room?.timer_seconds)||10;t.textContent=sec.toFixed(1)+"s";t.classList.toggle("urgent",sec>0&&sec<=3);if(fill){fill.style.width=Math.max(0,Math.min(100,sec/total*100))+"%";fill.classList.toggle("urgent",sec>0&&sec<=3);}}
 function startLocalTimer(endsAt){
  clearInterval(timerInterval);
- if(!endsAt){$("timer").textContent="PAUSED";return}
+ if(!endsAt){$("timer").textContent="PAUSED";const fill=$("timer-fill");if(fill)fill.style.width="0%";return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);$("timer").textContent=sec.toFixed(1)+"s";};
+ const update=()=>{const sec=Math.max(0,(deadline-Date.now())/1000);paintTimer(sec);};
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
@@ -296,7 +306,7 @@ function updateBidButton(){
 function prependActivity(e){
  const box=$("activity");if(!box)return;
  const placeholder=box.querySelector("p.muted");if(placeholder)placeholder.remove();
- const div=document.createElement("div");div.className="activity-item";div.textContent=e.message;
+ const div=document.createElement("div");div.className="activity-item kind-"+String(e.kind||"").replace(/[^A-Z_]/g,"");div.textContent=e.message;
  box.prepend(div);
  while(box.children.length>30)box.lastElementChild.remove();
 }
@@ -334,14 +344,14 @@ $("create-form").addEventListener("submit",async e=>{
    name:fd.get("name"),franchises,purse:Number(fd.get("purse")),timer_seconds:Number(fd.get("timer_seconds")),
    min_squad:Number(fd.get("min_squad")),max_squad:Number(fd.get("max_squad")),bid_extension:fd.get("bid_extension")==="on"
   })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(x.detail);return x});
-  const base=location.origin;let html=`<h2>Room created: ${d.room_code}</h2><p>Save these links now. The raw invite tokens are only shown once.</p><p><b>Host link:</b> <a href="${base}${d.host_url}&host=1">${base}${d.host_url}&host=1</a></p><h3>Franchise invites</h3>`;
-  d.franchise_invites.forEach(x=>html+=`<p><b>${esc(x.franchise)}:</b> <a href="${base}${x.url}">${base}${x.url}</a></p>`);
+  const base=location.origin;let html=`<h2>Your private auction is ready</h2><p>Share each franchise's private link. The password is the private token contained in that link. Save the host link securely; these credentials are shown only once.</p><p><b>Host access:</b> <a href="${base}${d.host_url}&host=1">Open host session</a></p><h3>Franchise access</h3>`;
+  d.franchise_invites.forEach(x=>html+=`<p><b>${esc(x.franchise)}:</b> <a href="${base}${x.url}">Open private invite</a> · Password: <code>${esc(x.token)}</code></p>`);
   html+=`<p>Players loaded: ${d.players_loaded}. Copy the host link and franchise links somewhere safe.</p>`;
   $("invite-output").innerHTML=html;show("invite-output");hide("landing");
-  roomCode=d.room_code;token=d.host_token;isHost=true;history.replaceState({}, "", `/?room=${roomCode}&token=${token}&host=1`);await init();
+  roomCode=d.room_code;token=d.host_token;isHost=true;localStorage.setItem(`smat-session:${roomCode}`,token);history.replaceState({}, "", `/?room=${roomCode}`);await init();
  }catch(err){alert(err.message)}
 });
-$("copy-link").onclick=()=>navigator.clipboard.writeText(location.href);
+$("copy-link").onclick=()=>navigator.clipboard.writeText(`${location.origin}/?room=${encodeURIComponent(roomCode)}&token=${encodeURIComponent(token)}&host=1`);
 // The amount sent is the price that was on the button when the user pressed it (pointerdown),
 // so a price that changes under their finger is rejected as stale instead of being bid blindly.
 $("bid-button").addEventListener("pointerdown",()=>{
@@ -423,4 +433,14 @@ $("nominate").onclick=async()=>{
  try{const d=await api(`/api/rooms/${roomCode}/nominate-unsold`,{method:"POST",body:JSON.stringify({player_ids:ids,price_overrides})});render(d);}
  catch(e){alert(e.message)}
 };
+$("login-form").addEventListener("submit",async e=>{
+ e.preventDefault();const fd=new FormData(e.target),err=$("login-error");err.textContent="Signing in…";
+ try{
+  const r=await fetch(`/api/rooms/${encodeURIComponent(roomCode)}/login`,{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({franchise_name:fd.get("franchise_name"),password:fd.get("password")})});
+  const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Sign-in failed");
+  token=d.token;localStorage.setItem(`smat-session:${roomCode}`,token);
+  history.replaceState({},"",`/?room=${encodeURIComponent(roomCode)}`);await init();
+ }catch(error){err.textContent=error.message;}
+});
 init();

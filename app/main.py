@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select, inspect, text, and_
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 from . import perf
 from .db import Base, engine, SessionLocal, get_db
@@ -425,6 +426,33 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
             "host_url": f"/?room={code}&token={host_token}",
             "franchise_invites": invite_links, "players_loaded": len(players)}
 
+@app.post("/api/rooms/{code}/login")
+def login_room(code: str, payload: dict, db: Session = Depends(get_db)):
+    """Exchange a room-local franchise name + invite password for the existing bearer token.
+
+    The invite token is the password (it is generated randomly and only shown at room
+    creation). No plaintext password is stored; the database continues to store only
+    its SHA-256 application-secret hash in invite_hash.
+    """
+    name = str(payload.get("franchise_name", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    if not name or not password:
+        raise HTTPException(400, "Enter your franchise name and password")
+    hashed = token_hash(password)
+    room = db.scalar(select(Room).where(Room.code == code.upper()))
+    if not room:
+        raise HTTPException(404, "Auction not found")
+    if name.casefold() in ("host", "administrator") and secrets.compare_digest(room.host_token_hash, hashed):
+        return {"token": password, "is_host": True, "franchise": None}
+    franchise = db.scalar(select(Franchise).where(
+        Franchise.room_id == room.id,
+        Franchise.name.ilike(name),
+        Franchise.invite_hash == hashed
+    ))
+    if not franchise:
+        raise HTTPException(401, "Incorrect franchise name or password")
+    return {"token": password, "is_host": False, "franchise": franchise.name}
+
 @app.get("/api/rooms/{code}/me")
 def get_me(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
     room, franchise, is_host = auth_context(db, code, authorization)
@@ -543,7 +571,7 @@ def _log_bid(**fields):
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
-def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str):
+def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str, _retry: int = 0):
     """Authenticate, validate, write and COMMIT one bid; never touches a full snapshot.
 
     Returns (http_status, body, rearm_deadline). Round trips on the normal path (excluding the
@@ -555,8 +583,21 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
     if (code, hashed) not in _verified:
         # First bid from this credential in this process: verify it BEFORE queueing for the
         # lock, so unauthenticated callers can never hold up real bidders.
-        with SessionLocal() as pre:
-            auth_context(pre, code, authorization)
+        try:
+            with SessionLocal() as pre:
+                auth_context(pre, code, authorization)
+        except DBAPIError as auth_db_error:
+            retryable = bool(getattr(auth_db_error, "connection_invalidated", False)) or (
+                isinstance(auth_db_error, OperationalError) and any(term in str(getattr(auth_db_error, "orig", auth_db_error)).lower() for term in (
+                    "server closed the connection", "connection is closed", "connection reset",
+                    "could not connect", "broken pipe", "terminating connection", "timeout expired"
+                ))
+            )
+            if retryable and _retry == 0:
+                logger.warning("bid_auth_connection_retry room=%s", code)
+                engine.dispose()
+                return _process_bid(code, authorization, req, request_id, _retry=1)
+            raise
     t_auth = time.perf_counter()
     timings = {}
     base = dict(request_id=request_id, room=code, submitted=req.amount)
@@ -622,6 +663,23 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
                         db.rollback()
                     except Exception:
                         pass
+                    error_text = str(getattr(e, "orig", e)).lower()
+                    retryable_connection = isinstance(e, DBAPIError) and (
+                        bool(getattr(e, "connection_invalidated", False)) or
+                        (isinstance(e, OperationalError) and any(term in error_text for term in (
+                            "server closed the connection", "connection is closed", "connection reset",
+                            "could not connect", "broken pipe", "terminating connection", "timeout expired"
+                        )))
+                    )
+                    if retryable_connection and not committing and _retry == 0:
+                        logger.warning("bid_db_connection_retry request_id=%s room=%s", request_id, code)
+                        # The transaction has been rolled back and COMMIT was never attempted,
+                        # so retrying cannot double-accept a bid. Dispose stale pooled sockets.
+                        try:
+                            engine.dispose()
+                        except Exception:
+                            logger.exception("pool_dispose_failed room=%s", code)
+                        return _process_bid(code, authorization, req, request_id, _retry=1)
                     code_ = "BID_NOT_CONFIRMED" if committing else "BID_NOT_SAVED"
                     logger.exception("bid_failed request_id=%s room=%s reason=%s err=%s", request_id, code, code_, type(e).__name__)
                     msg = ("Your bid could not be confirmed. Check the current price before bidding again."

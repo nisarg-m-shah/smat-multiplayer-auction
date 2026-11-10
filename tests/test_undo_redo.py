@@ -45,7 +45,8 @@ def test_sale_undo_redo_restores_purse_and_squad_sale():
     settle_lot(db, room); db.commit()
     assert mi.purse_remaining == 4980
     undo_last_sale(db, room); db.commit()
-    assert mi.purse_remaining == 5000 and lot.status == "QUEUED"
+    assert mi.purse_remaining == 5000 and lot.status == "LIVE"
+    assert lot.current_bid == 20 and lot.highest_franchise_id == mi.id
     redo_last_sale(db, room); db.commit()
     assert mi.purse_remaining == 4980 and lot.status == "SOLD"
     db.close()
@@ -61,7 +62,7 @@ def test_unsold_player_can_be_undone_and_redone():
     from app.engine import undo_last_sale
     undo_last_sale(db, room)
     db.commit()
-    assert lot.status == "QUEUED" and lot.settlement_redo_available is True
+    assert lot.status == "LIVE" and lot.settlement_redo_available is True
     redo_last_sale(db, room)
     db.commit()
     assert lot.status == "UNSOLD" and lot.settlement_redo_available is False
@@ -86,4 +87,37 @@ def test_unsold_only_round_skips_unseen_players_and_opens_selected_unsold():
     assert room.current_lot_id is not None
     assert db.get(Lot, room.current_lot_id).player_id == first_lot.player_id
     assert db.query(Lot).filter(Lot.player_id == unseen.id).one().status == "SKIPPED"
+    db.close()
+
+
+def test_undo_sold_lot_reopens_at_last_bid_then_restores_parked_next_lot():
+    from app.engine import open_next_lot
+    db, room, mi, csk, first = make_auction()
+    place_bid(db, room, mi, 20); db.commit()
+    first.ends_at = now_utc() - timedelta(seconds=1); db.commit()
+    settle_lot(db, room); db.commit()
+    next_player = Player(room_id=room.id, name="Next Player", state_team="Y", role="BAT", base_price=30)
+    db.add(next_player); db.flush()
+    next_lot = Lot(room_id=room.id, player_id=next_player.id, round_no=1, queue_order=1,
+                   status="QUEUED", base_price=30)
+    db.add(next_lot); db.flush()
+    open_next_lot(db, room); db.commit()
+    assert room.current_lot_id == next_lot.id
+    place_bid(db, room, csk, 30); db.commit()
+    next_lot.ends_at = now_utc() + timedelta(seconds=7); db.commit()
+
+    undo_last_sale(db, room); db.commit()
+    assert room.current_lot_id == first.id
+    assert first.status == "LIVE" and first.current_bid == 20
+    assert first.highest_franchise_id == mi.id
+    assert next_lot.status == "QUEUED" and next_lot.current_bid == 30
+    assert next_lot.highest_franchise_id == csk.id
+    assert next_lot.remaining_ms is not None and next_lot.remaining_ms > 0
+
+    first.ends_at = now_utc() - timedelta(seconds=1); db.commit()
+    settle_lot(db, room); db.commit()
+    reopened = open_next_lot(db, room); db.commit()
+    assert reopened.id == next_lot.id and reopened.status == "LIVE"
+    assert reopened.current_bid == 30 and reopened.highest_franchise_id == csk.id
+    assert reopened.ends_at is not None and reopened.remaining_ms is None
     db.close()
