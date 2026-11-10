@@ -1,13 +1,12 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#090a0c">
-<title>SMAT Auction Room</title><link rel="preload" href="/static/fonts/inter-bold.otf" as="font" type="font/otf" crossorigin><link rel="stylesheet" href="/static/style.css?v=ipl-premium-2">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#090a0c">
+<title>SMAT Auction Room</title><link rel="preload" href="/static/fonts/inter-bold.otf" as="font" type="font/otf" crossorigin><link rel="stylesheet" href="/static/style.css?v=ipl-premium-1">
 </head>
 <body>
 <div id="app">
-  <header><div class="brand-lockup"><span class="ball" aria-hidden="true"></span><div><div class="eyebrow">PRIVATE MULTIPLAYER AUCTION</div><h1>SMAT Auction Room</h1></div></div><div id="connection" class="pill">Not connected</div></header>
+  <header><div><div class="eyebrow">PRIVATE MULTIPLAYER AUCTION</div><h1>SMAT Auction Room</h1></div><div id="connection" class="pill">Not connected</div></header>
   <main>
     <section id="landing" class="panel">
       <h2>Create a private auction</h2>
@@ -39,7 +38,6 @@
       <div id="live-area" class="hidden">
         <section class="auction-grid">
           <div class="panel player-panel">
-            <div class="timer-bar" aria-hidden="true"><i id="timer-fill"></i></div>
             <div class="eyebrow" id="round-label">ROUND 1</div><div id="player-role" class="tag">PLAYER</div>
             <h2 id="player-name">Waiting for player</h2><p id="player-team" class="muted"></p>
             <div class="price-row"><div><span class="muted">BASE PRICE</span><strong id="base-price">—</strong></div><div><span class="muted">CURRENT BID</span><strong id="current-bid">—</strong></div></div>
@@ -72,5 +70,5 @@
   <div id="celebration" class="celebration hidden" aria-live="polite"><div class="celebration-card"><div id="celebration-title"></div><div id="celebration-detail"></div></div><div id="confetti-layer"></div></div>
   <footer>Private room · Server-controlled bidding · No real-money transactions</footer>
 </div>
-<script src="/static/app.js?v=ipl-premium-2"></script>
+<script src="/static/app.js?v=ipl-premium-1"></script>
 </body></html>
