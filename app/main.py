@@ -540,7 +540,13 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
                 lowered = [f for f in db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()
                            if f.name.lower() == name.lower()]
                 franchise = lowered[0] if lowered else None
-            if franchise is not None and franchise.login_nonce and check_password(payload.password, franchise.password_hash):
+            if franchise is not None and franchise.id == room.host_franchise_id:
+                # The host's own franchise has no separate password: it IS the host login.
+                if room.host_nonce and check_password(payload.password, room.host_password_hash):
+                    token, is_host = derive_token("host", room.host_nonce), True
+                else:
+                    franchise = None
+            elif franchise is not None and franchise.login_nonce and check_password(payload.password, franchise.password_hash):
                 token = derive_token("franchise", franchise.login_nonce)
             else:
                 franchise = None
@@ -560,7 +566,9 @@ def franchise_names(code: str, db: Session = Depends(get_db)):
     if room is None:
         raise HTTPException(404, "Room not found")
     names = db.scalars(select(Franchise.name).where(Franchise.room_id == room.id).order_by(Franchise.created_order)).all()
-    return {"franchises": list(names), "host_name": HOST_LOGIN_NAME}
+    host_f = db.get(Franchise, room.host_franchise_id) if room.host_franchise_id else None
+    return {"franchises": list(names), "host_name": HOST_LOGIN_NAME,
+            "host_franchise": host_f.name if host_f else None}
 
 class ResetPassword(BaseModel):
     franchise_id: int | None = None   # None = the host's own password

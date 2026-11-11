@@ -37,12 +37,7 @@
       <div class="hero">
         <div class="eyebrow live"><i class="dot"></i> LIVE · REAL-TIME · PRIVATE</div>
         <h1>Bid. Build.<br><span class="grad">Own the season.</span></h1>
-        <p class="lead">A private, server-timed auction room for your franchise league. Every bid is confirmed by the server and appears on every screen the moment it lands.</p>
-        <ul class="hero-points">
-          <li><b>Exact-price bidding</b><span>No surprise amounts. You bid what you see.</span></li>
-          <li><b>Stays signed in</b><span>Drop off Wi-Fi mid-auction and you are right back in.</span></li>
-          <li><b>Host in control</b><span>Pause, undo and resume without losing the lot.</span></li>
-        </ul>
+        <p class="lead">Your league's auction, live. Sign in with the room code and password from your host, then bid for the players your squad needs.</p>
       </div>
       <div class="panel auth-card">
         <div class="tabs" role="tablist">
@@ -53,7 +48,7 @@
         <form id="login-form" class="tab-pane" autocomplete="on">
           <p class="muted">Use the room code, franchise name and password your host sent you.</p>
           <label>Room code<input id="login-room" name="room" class="code-input" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="ABC123" required></label>
-          <label>Franchise<input id="login-franchise" name="franchise" list="login-franchise-list" autocomplete="username" placeholder="Your franchise name" required><datalist id="login-franchise-list"></datalist></label>
+          <label>Franchise<select id="login-franchise" name="franchise" required disabled><option value="">Enter the room code first</option></select></label>
           <label>Password<input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Password from your host" required></label>
           <div id="login-error" class="form-error hidden" role="alert"></div>
           <button class="primary wide" id="login-submit">Enter the auction</button>
@@ -70,7 +65,6 @@
           </div>
           <label class="check"><input type="checkbox" name="bid_extension" checked><span>Extend timer when a bid arrives</span></label>
           <button class="primary wide">Create room</button>
-          <p class="note">Player data loads from <code>Auction.py</code> in the data folder. Otherwise import a CSV in the pool manager.</p>
         </form>
       </div>
     </section>
@@ -98,7 +92,7 @@
 
         <!-- host controls: right above the bidding so they are one tap away -->
         <section id="host-bar" class="host-bar hidden" aria-label="Host controls">
-          <div class="host-bar-head"><span class="host-tag">HOST</span><span id="room-status" class="status-pill" data-status="">—</span></div>
+          <span id="room-status" class="status-pill" data-status="">—</span>
           <div class="button-row">
             <button data-action="pause" class="ctl">Pause</button>
             <button data-action="resume" class="ctl go">Resume</button>
@@ -107,7 +101,21 @@
             <button data-action="undo-sale" class="ctl warn">Undo <span class="opt">last </span>player</button>
             <button data-action="redo-sale" class="ctl">Redo <span class="opt">last </span>player</button>
             <button data-action="finish" class="ctl danger">End auction</button>
+            <button id="host-more" class="ctl more" type="button" aria-expanded="false" aria-controls="admin-controls">More <i class="chev" aria-hidden="true"></i></button>
           </div>
+        </section>
+
+        <!-- more host tools: a drawer that opens right under the bar -->
+        <section id="admin-controls" class="panel drawer drawer-closed hidden">
+          <details class="tool"><summary>My franchise</summary>
+            <div class="host-franchise-picker"><label><select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
+          </details>
+          <details class="tool"><summary>Unsold-only round</summary>
+            <div class="nomination"><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players &amp; start unsold-only round</button></div>
+          </details>
+          <details class="tool"><summary>Access &amp; passwords</summary>
+            <div id="access-live" class="access-block"></div>
+          </details>
         </section>
 
         <section class="auction-grid">
@@ -170,12 +178,6 @@
           </div>
         </section>
 
-        <section id="admin-controls" class="panel hidden">
-          <div class="section-head"><h2>More host tools</h2><span class="muted">Host can also manage a franchise</span></div>
-          <div class="host-franchise-picker"><label>My franchise<select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
-          <div class="nomination"><h3>Unsold-only round</h3><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players &amp; start unsold-only round</button></div>
-          <div id="access-live" class="access-block"></div>
-        </section>
       </div>
 
       <section id="final-results" class="hidden">

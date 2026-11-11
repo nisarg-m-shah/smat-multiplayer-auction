@@ -100,7 +100,7 @@ async function render(s){
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
  state=s;lastSnapshot=s;bidFieldsVersion=0;noteSnapshotTime(s);
  franchiseOrder=(s.franchises||[]).map(f=>Number(f.id));
- if(isHost){const key=franchiseOrder.join(",");if(key!==render._accessKey){render._accessKey=key;const fl=(s.franchises||[]).map(f=>({id:f.id,name:f.name}));renderAccess($("invite-list"),fl);renderAccess($("access-live"),fl)}}
+ if(isHost){const key=franchiseOrder.join(",")+"|"+(s.room.host_franchise_id||"");if(key!==render._accessKey){render._accessKey=key;if(lastCreds&&!$("invite-output").classList.contains("hidden"))showCredentials(lastCreds);const fl=(s.franchises||[]).filter(f=>Number(f.id)!==Number(s.room.host_franchise_id)).map(f=>({id:f.id,name:f.name}));renderAccess($("invite-list"),fl);renderAccess($("access-live"),fl)}}
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
@@ -308,6 +308,7 @@ function syncHostFranchisePickers(s){
  });
 }
 function renderFinalResults(s){
+ hide("invite-output");
  const franchises=s.franchises||[];
  const totalPlayers=franchises.reduce((n,f)=>n+(f.squad_count||0),0);
  const totalSpent=franchises.reduce((n,f)=>n+Math.max(0,(s.room.purse||0)-(f.purse_remaining||0)),0);
@@ -315,11 +316,13 @@ function renderFinalResults(s){
   <div class="final-stat panel"><span>FRANCHISES</span><strong>${franchises.length}</strong></div>
   <div class="final-stat panel"><span>PLAYERS SOLD</span><strong>${totalPlayers}</strong></div>
   <div class="final-stat panel"><span>TOTAL SPENT</span><strong>${money(totalSpent)}</strong></div>`;
- $("final-franchises").innerHTML=franchises.map(f=>{
+ const isMine=f=>!!(myFranchise&&Number(myFranchise.id)===Number(f.id));
+ const ordered=[...franchises].sort((a,b)=>isMine(b)-isMine(a));
+ $("final-franchises").innerHTML=ordered.map(f=>{
   const squad=f.squad||[];
   const spent=Math.max(0,(s.room.purse||0)-(f.purse_remaining||0));
-  return `<article class="final-team panel">
-   <div class="final-team-head"><div><div class="eyebrow">FINAL SQUAD</div><h3>${esc(f.name)}</h3></div><div class="final-team-count">${squad.length} / ${s.room.max_squad}</div></div>
+  return `<article class="final-team panel${isMine(f)?" mine":""}">
+   <div class="final-team-head"><div><div class="eyebrow">FINAL SQUAD${isMine(f)?'<span class="you-tag">Your team</span>':""}</div><h3>${esc(f.name)}</h3></div><div class="final-team-count">${squad.length} / ${s.room.max_squad}</div></div>
    <div class="final-team-metrics"><div><span>Spent</span><strong>${money(spent)}</strong></div><div><span>Remaining purse</span><strong>${money(f.purse_remaining)}</strong></div></div>
    ${squad.length?`<div class="table-wrap"><table class="final-squad-table"><thead><tr><th>#</th><th>Player</th><th>State team</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.player)}</td><td>${esc(p.state_team||"—")}</td><td>${esc(p.role||"—")}</td><td>${money(p.price)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="muted">No players purchased.</p>`}
   </article>`;
@@ -636,8 +639,12 @@ async function copyText(t,btn){
  try{await navigator.clipboard.writeText(t)}catch(e){const a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();try{document.execCommand("copy")}catch(_){}a.remove()}
  if(btn){const o=btn.textContent;btn.textContent="Copied";setTimeout(()=>btn.textContent=o,1400)}
 }
+let lastCreds=null;
 function showCredentials(d){
- const rows=[{franchise:d.host_login.franchise,password:d.host_login.password,host:true},...d.credentials];
+ lastCreds=d;
+ const hfId=state?.room?.host_franchise_id,hf=hfId&&(state.franchises||[]).find(f=>Number(f.id)===Number(hfId));
+ // If the host plays as a franchise, that franchise is the host login: no separate row or password for it.
+ const rows=[{franchise:hf?hf.name:d.host_login.franchise,password:d.host_login.password,host:true,label:hf?"HOST":null},...d.credentials.filter(c=>!hf||c.franchise!==hf.name)];
  const box=$("invite-output");
  box.innerHTML=`<div class="section-head"><div><h2>Auction created</h2><p class="muted">Send each person their franchise name, password and the room code. Passwords are shown <b>only now</b>; you can issue a new one any time from Access.</p></div>
   <button class="secondary" id="cred-copy-all" type="button">Copy all</button></div>
@@ -651,10 +658,19 @@ function showCredentials(d){
 }
 let namesTimer=null;
 async function loadFranchiseNames(){
- const code=$("login-room").value.trim().toUpperCase();const dl=$("login-franchise-list");
- if(code.length<4){dl.innerHTML="";return}
- try{const r=await fetch(`/api/rooms/${encodeURIComponent(code)}/franchise-names`);if(!r.ok){dl.innerHTML="";return}
-  const d=await r.json();dl.innerHTML=[...d.franchises,d.host_name].map(n=>`<option value="${esc(n)}">`).join("")}catch(e){}
+ const code=$("login-room").value.trim().toUpperCase(),sel=$("login-franchise");
+ const reset=msg=>{sel.innerHTML=`<option value="">${msg}</option>`;sel.disabled=true};
+ if(code.length<4){reset("Enter the room code first");return}
+ try{
+  const r=await fetch(`/api/rooms/${encodeURIComponent(code)}/franchise-names`);
+  if(!r.ok){reset("Room not found");return}
+  const d=await r.json(),keep=sel.value;
+  // The host's own franchise is the host login: one entry, not a franchise plus a separate "Host".
+  const opts=d.franchises.map(n=>n===d.host_franchise?`<option value="${esc(n)}">${esc(n)} (Host)</option>`:`<option value="${esc(n)}">${esc(n)}</option>`);
+  if(!d.host_franchise)opts.push(`<option value="${esc(d.host_name)}">Host (organiser)</option>`);
+  sel.innerHTML=`<option value="">Select your franchise</option>`+opts.join("");
+  sel.disabled=false;if(keep&&[...sel.options].some(o=>o.value===keep))sel.value=keep;
+ }catch(e){reset("Could not load. Check your connection")}
 }
 $("login-room").addEventListener("input",()=>{clearTimeout(namesTimer);namesTimer=setTimeout(loadFranchiseNames,300)});
 $("login-form").addEventListener("submit",async e=>{
@@ -682,3 +698,10 @@ function renderAccess(el,franchises){
   }catch(err){alert(err.message)}
  });
 }
+
+$("host-more").onclick=()=>{
+ const d=$("admin-controls"),open=d.classList.toggle("drawer-closed")===false;
+ $("host-more").setAttribute("aria-expanded",open);
+ try{localStorage.setItem("smat.hostDrawer",open?"1":"0")}catch(e){}
+};
+try{if(localStorage.getItem("smat.hostDrawer")==="1"){$("admin-controls").classList.remove("drawer-closed");$("host-more").setAttribute("aria-expanded","true")}}catch(e){}

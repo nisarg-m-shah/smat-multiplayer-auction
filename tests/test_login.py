@@ -102,3 +102,17 @@ def test_reset_requires_host(client):
 def test_host_name_is_reserved(client):
     r = client.post("/api/rooms", json={"name": "T", "franchises": ["Host", "Other"]})
     assert r.status_code == 400
+
+
+def test_host_franchise_logs_in_with_the_host_password_only(client):
+    main._login_failures.clear()
+    d = _create(client)
+    code = d["room_code"]; host = {"Authorization": "Bearer " + d["host_token"]}
+    fid = client.get(f"/api/rooms/{code}/snapshot", headers=host).json()["franchises"][0]["id"]
+    assert client.post(f"/api/rooms/{code}/host/select-franchise", json={"franchise_id": fid}, headers=host).status_code == 200
+    names = client.get(f"/api/rooms/{code}/franchise-names").json()
+    assert names["host_franchise"] == "Mumbai"
+    ok = _login(client, code, "Mumbai", d["host_login"]["password"]).json()
+    assert ok["is_host"] and ok["token"] == d["host_token"] and ok["franchise"]["name"] == "Mumbai"
+    # the franchise's own (never to be handed out) password no longer works
+    assert _login(client, code, "Mumbai", d["credentials"][0]["password"]).status_code == 401

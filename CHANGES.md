@@ -73,3 +73,9 @@ Server side was healthy: accepted bids `total_ms` ≈ 365–393 ms, `db_stmts=3`
 - **Late-bid grace**: bids are judged by when the request *arrived* at the server, not when the database finished, and bids up to `BID_GRACE_SECONDS` (default 0.8) after the deadline still count. The player is sold only after grace plus `SETTLE_SLACK_SECONDS` (0.25). Set `BID_GRACE_SECONDS=0` to disable.
 - **Clock sync**: browsers now measure their offset against the server (`GET /api/time`, lowest-latency of several samples, refreshed every 15 s and on reconnect/focus), so a phone with a wrong clock shows the same countdown as everyone else.
 - **UI**: Franchises / Activity tabs next to (mobile: under) the bid box; "Your team" card (purse, squad, spent, role counts, players with roles) lives at the top of Franchises and is not repeated in the list; the bid box shows the highest bidder with their badge.
+
+## Update: final screen, home copy, dropdown login, compact host bar
+- **Final screen** puts your own team first with a gold "Your team" highlight.
+- **Home page** copy shortened; developer-only note about `Auction.py` removed from the UI.
+- **Franchise dropdown** on the join form (filled in from the room code). If the host plays as a franchise, that franchise *is* the host login: one entry "Name (Host)", signed in with the host password; no separate "Host" option and no separate franchise password to hand out. The credentials card and Access panel update accordingly.
+- **Host bar** is a single row of buttons; status pill sits at the left and a "More" button opens a drawer (My franchise, Unsold-only round, Access & passwords), each section expandable.
