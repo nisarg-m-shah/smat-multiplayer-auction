@@ -1,20 +1,20 @@
 import asyncio, json, re, secrets, string, os, logging, time, uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select, inspect, text, and_
-from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError, OperationalError
 from . import perf
 from .db import Base, engine, SessionLocal, get_db
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
-from .security import new_token, token_hash
+from .security import new_token, new_password, normalize_credential, token_hash
 from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD, MIN_SQUAD
 from .seed import load_players, load_players_csv
-from .engine import (get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
+from .engine import (result_pause_for, get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
                      undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc,
                      recover_interrupted_rooms, lock_for,
@@ -300,7 +300,7 @@ def _settle_expired_lot(code):
             if seconds_until(lot.ends_at) > 0:     # a bid extended the timer; not expired after all
                 return False, lot.ends_at
             settle_lot(db, room)
-            new_lot = open_next_lot(db, room)
+            new_lot = open_next_lot(db, room, lead_in=result_pause_for(lot))
             room.version += 1                      # clients order/validate updates by version
             db.commit()
             snap = snapshot(db, room)
@@ -391,8 +391,8 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
     names = [x.strip() for x in payload.franchises if x.strip()]
     if len(names) != len(payload.franchises) or len(set(n.lower() for n in names)) != len(names):
         raise HTTPException(400, "Franchise names must be non-empty and unique")
-    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    host_token = new_token()
+    code = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(6))   # no 0/O/1/I/L: read out loud and typed on phones
+    host_token = new_password()
     room = Room(code=code, name=payload.name, host_token_hash=token_hash(host_token),
                 purse=payload.purse, timer_seconds=payload.timer_seconds,
                 min_squad=payload.min_squad, max_squad=payload.max_squad,
@@ -401,12 +401,14 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
     db.flush()
     invite_links = []
     for i, name in enumerate(names):
-        token = new_token()
+        token = new_password()
         f = Franchise(room_id=room.id, name=name, invite_hash=token_hash(token),
                       purse_remaining=payload.purse, created_order=i)
         db.add(f)
         db.flush()
-        invite_links.append({"franchise": name, "token": token,
+        # `password` is what the franchise types at login. It is also the bearer credential, so the
+        # bid path is unchanged. `url` keeps working as a direct-login link.
+        invite_links.append({"franchise": name, "franchise_id": f.id, "password": token, "token": token,
                              "url": f"/?room={code}&token={token}"})
     players = payload.players
     if players is None:
@@ -422,36 +424,79 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
                       included=bool(p.get("included", True)), source_order=int(p.get("source_order", i))))
     event(db, room.id, "ROOM_CREATED", "Auction room created.", {"franchises": names})
     db.commit()
-    return {"room_code": code, "host_token": host_token,
+    return {"room_code": code, "host_token": host_token, "host_password": host_token,
             "host_url": f"/?room={code}&token={host_token}",
             "franchise_invites": invite_links, "players_loaded": len(players)}
 
-@app.post("/api/rooms/{code}/login")
-def login_room(code: str, payload: dict, db: Session = Depends(get_db)):
-    """Exchange a room-local franchise name + invite password for the existing bearer token.
+_login_failures: dict[str, list[float]] = {}
 
-    The invite token is the password (it is generated randomly and only shown at room
-    creation). No plaintext password is stored; the database continues to store only
-    its SHA-256 application-secret hash in invite_hash.
-    """
-    name = str(payload.get("franchise_name", "")).strip()
-    password = str(payload.get("password", "")).strip()
-    if not name or not password:
-        raise HTTPException(400, "Enter your franchise name and password")
-    hashed = token_hash(password)
-    room = db.scalar(select(Room).where(Room.code == code.upper()))
-    if not room:
-        raise HTTPException(404, "Auction not found")
-    if name.casefold() in ("host", "administrator") and secrets.compare_digest(room.host_token_hash, hashed):
-        return {"token": password, "is_host": True, "franchise": None}
-    franchise = db.scalar(select(Franchise).where(
-        Franchise.room_id == room.id,
-        Franchise.name.ilike(name),
-        Franchise.invite_hash == hashed
-    ))
-    if not franchise:
-        raise HTTPException(401, "Incorrect franchise name or password")
-    return {"token": password, "is_host": False, "franchise": franchise.name}
+def _client_key(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() or (request.client.host if request.client else "?"))
+
+def _login_throttled(key: str) -> bool:
+    now = time.monotonic()
+    recent = [t for t in _login_failures.get(key, []) if now - t < 300]
+    _login_failures[key] = recent
+    if len(_login_failures) > 4096:
+        _login_failures.clear()
+    return len(recent) >= 15
+
+class LoginRequest(BaseModel):
+    room_code: str = Field(min_length=1, max_length=12)
+    team: str | int            # franchise id, or "host"
+    password: str = Field(min_length=1, max_length=200)
+
+@app.get("/api/rooms/{code}/teams")
+def room_teams(code: str, db: Session = Depends(get_db)):
+    """Names only (no credentials): lets the login screen offer a team list for a room code."""
+    room = db.scalar(select(Room).where(Room.code == code.strip().upper()))
+    if room is None:
+        raise HTTPException(404, "No auction found with that room code")
+    rows = db.scalars(select(Franchise).where(Franchise.room_id == room.id).order_by(Franchise.created_order)).all()
+    return {"room_name": room.name, "status": room.status, "teams": [{"id": f.id, "name": f.name} for f in rows]}
+
+@app.post("/api/login")
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    """Team + password -> the same bearer credential the invite links used. Nothing else about the
+    bid path changes: after login every request authenticates exactly as before."""
+    key = _client_key(request)
+    if _login_throttled(key):
+        raise HTTPException(429, "Too many wrong attempts. Wait a few minutes and try again.")
+    hashed = token_hash(payload.password)
+    code = payload.room_code.strip().upper()
+    room = db.scalar(select(Room).where(Room.code == code))
+    ok, franchise, is_host = False, None, False
+    if room is not None:
+        if str(payload.team).lower() == "host":
+            ok = is_host = secrets.compare_digest(room.host_token_hash, hashed)
+            if ok and room.host_franchise_id:
+                franchise = db.get(Franchise, room.host_franchise_id)
+        else:
+            try:
+                fid = int(payload.team)
+            except ValueError:
+                fid = None
+            franchise = db.scalar(select(Franchise).where(Franchise.id == fid, Franchise.room_id == room.id)) if fid is not None else None
+            ok = bool(franchise) and secrets.compare_digest(franchise.invite_hash, hashed)
+    if not ok:
+        _login_failures.setdefault(key, []).append(time.monotonic())
+        raise HTTPException(401, "Wrong room code, team or password")
+    _remember(code, hashed)
+    return {"token": normalize_credential(payload.password), "room_code": code, "is_host": is_host,
+            "franchise": ({"id": franchise.id, "name": franchise.name} if franchise else None)}
+
+@app.post("/api/rooms/{code}/host/reset-password")
+def reset_password(code: str, payload: dict, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    """Host-only: issue a new password for one franchise (the old one stops working for new requests)."""
+    room = require_host(db, code, authorization)
+    f = db.scalar(select(Franchise).where(Franchise.id == payload.get("franchise_id"), Franchise.room_id == room.id))
+    if f is None:
+        raise HTTPException(404, "Franchise not found in this room")
+    password = new_password()
+    f.invite_hash = token_hash(password)
+    db.commit()
+    return {"franchise_id": f.id, "franchise": f.name, "password": password}
 
 @app.get("/api/rooms/{code}/me")
 def get_me(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
@@ -571,7 +616,25 @@ def _log_bid(**fields):
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
-def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str, _retry: int = 0):
+def _is_dead_connection(exc: Exception) -> bool:
+    return isinstance(exc, DBAPIError) and (bool(getattr(exc, "connection_invalidated", False)) or isinstance(exc, OperationalError))
+
+def _read_with_retry(db, fn, *args):
+    """Run a READ; if the pooled connection turns out to be dead, discard it and retry once on a fresh
+    one. Used only before anything has been written, so a retry can never place a bid twice."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        if not _is_dead_connection(e):
+            raise
+        logger.warning("db_connection_retry err=%s", type(e).__name__)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return fn(*args)
+
+def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str):
     """Authenticate, validate, write and COMMIT one bid; never touches a full snapshot.
 
     Returns (http_status, body, rearm_deadline). Round trips on the normal path (excluding the
@@ -583,21 +646,8 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
     if (code, hashed) not in _verified:
         # First bid from this credential in this process: verify it BEFORE queueing for the
         # lock, so unauthenticated callers can never hold up real bidders.
-        try:
-            with SessionLocal() as pre:
-                auth_context(pre, code, authorization)
-        except DBAPIError as auth_db_error:
-            retryable = bool(getattr(auth_db_error, "connection_invalidated", False)) or (
-                isinstance(auth_db_error, OperationalError) and any(term in str(getattr(auth_db_error, "orig", auth_db_error)).lower() for term in (
-                    "server closed the connection", "connection is closed", "connection reset",
-                    "could not connect", "broken pipe", "terminating connection", "timeout expired"
-                ))
-            )
-            if retryable and _retry == 0:
-                logger.warning("bid_auth_connection_retry room=%s", code)
-                engine.dispose()
-                return _process_bid(code, authorization, req, request_id, _retry=1)
-            raise
+        with SessionLocal() as pre:
+            _read_with_retry(pre, auth_context, pre, code, authorization)
     t_auth = time.perf_counter()
     timings = {}
     base = dict(request_id=request_id, room=code, submitted=req.amount)
@@ -612,7 +662,7 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
                 wrote = False
                 committing = False
                 try:
-                    ctx = load_bid_context(db, code, hashed)       # authenticate + read state (1 round trip)
+                    ctx = _read_with_retry(db, load_bid_context, db, code, hashed)   # authenticate + read state (1 round trip)
                     t_read = time.perf_counter()
                     validate_bid(ctx, req.amount, lot_id=req.lot_id, player_id=req.player_id,
                                  franchise_id=req.franchise_id)
@@ -663,23 +713,6 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
                         db.rollback()
                     except Exception:
                         pass
-                    error_text = str(getattr(e, "orig", e)).lower()
-                    retryable_connection = isinstance(e, DBAPIError) and (
-                        bool(getattr(e, "connection_invalidated", False)) or
-                        (isinstance(e, OperationalError) and any(term in error_text for term in (
-                            "server closed the connection", "connection is closed", "connection reset",
-                            "could not connect", "broken pipe", "terminating connection", "timeout expired"
-                        )))
-                    )
-                    if retryable_connection and not committing and _retry == 0:
-                        logger.warning("bid_db_connection_retry request_id=%s room=%s", request_id, code)
-                        # The transaction has been rolled back and COMMIT was never attempted,
-                        # so retrying cannot double-accept a bid. Dispose stale pooled sockets.
-                        try:
-                            engine.dispose()
-                        except Exception:
-                            logger.exception("pool_dispose_failed room=%s", code)
-                        return _process_bid(code, authorization, req, request_id, _retry=1)
                     code_ = "BID_NOT_CONFIRMED" if committing else "BID_NOT_SAVED"
                     logger.exception("bid_failed request_id=%s room=%s reason=%s err=%s", request_id, code, code_, type(e).__name__)
                     msg = ("Your bid could not be confirmed. Check the current price before bidding again."
@@ -730,11 +763,11 @@ def _apply_host_action(db, room, action):
             if lot:
                 lot.ends_at = now_utc()
                 settle_lot(db, room)
+                open_next_lot(db, room, lead_in=result_pause_for(lot))
+                return
         open_next_lot(db, room)
     elif action == "undo-sale":
         undo_last_sale(db, room)
-        if room.status not in ("LIVE", "PAUSED", "COMPLETED"):
-            open_next_lot(db, room)
     elif action == "undo-bid":
         undo_last_bid(db, room)
     elif action == "redo-bid":

@@ -59,3 +59,52 @@ Expect roughly this if your real RTT is ~75 ms; **confirm in your Render logs** 
 
 ## Update 3 (root cause of the live-test failure, from your Render logs)
 Server side was healthy: accepted bids `total_ms` ≈ 365–393 ms, `db_stmts=3`, broadcast ≈ 1 ms. The failures were caused by browsers still running the OLD cached `app.js` (your page loaded `app.js?v=dd69e53-fix1`; my `?v=3` edit never matched your index.html, and no `/static/app.js` request appears after the redeploy). The old frontend ignores `BID_ACCEPTED` events, so other clients kept showing the old price, bid it again, got `STALE_BID`, and only then fetched a snapshot. Fixed by server-side content-hash stamping (above). If you merged files by hand, keep `index.html` from this zip or leave it as is: the server rewrites the asset URLs either way.
+
+
+## Update 4 — premium look, result pause, undo fix, team+password login
+
+**1. Premium IPL look (CSS + small markup/JS touches).** New dark black/amber theme, gradient accents,
+Oswald/Inter type, team avatars on franchise cards, a draining timer bar that turns red in the last 3 s,
+colour-coded activity feed, restyled result banner, phone-first spacing. All element IDs, the layout and all
+bidding logic are unchanged. (Fonts load from Google Fonts; without internet the system fonts are used.)
+
+**2. Result banner then next player.** After a player is settled the server opens the next lot with its timer
+starting `RESULT_PAUSE_SOLD_SECONDS` (default 4) / `RESULT_PAUSE_UNSOLD_SECONDS` (default 3) later. During that
+pause every client shows "Next player coming up…" (no name, no price, no bid button) and the banner is cut
+short to end exactly when the player is revealed. The server also rejects bids in that window
+(`PLAYER_NOT_STARTED`), so a hidden player can never be bid on. Set both env vars to 0 to switch it off.
+
+**3. Host controls** moved above the bidding panel. Franchise picker and the unsold-only round are under
+"More host options" (collapsed).
+
+**4. Undo last player.** The player goes back on the block at his last highest bid, with the bid history kept
+(Undo last bid still works) and the room PAUSED so the host can check before pressing Resume. Whoever was
+already live as the next player is put back at the front of the queue (their bids, if any, are cleared) and
+starts fresh after the restored player is settled. "Redo last player" works until Resume is pressed.
+
+**5. Login with team + password.** Rooms now get short passwords (`XXXXX-XXXXX`, no look-alike characters) for
+every franchise and the host. Login = room code + team + password. The password IS the bearer credential, so
+bidding, WebSocket and every other request authenticate exactly as before (no extra queries, same ~4 round
+trips per bid). No schema change; old rooms and old long invite links keep working.
+- Stays signed in: credential kept per tab (sessionStorage) and per device (localStorage). Reload, lost
+  connection, closed tab: still signed in. Network errors never sign anyone out; only Log out, or a password the
+  host reset, does. During an outage the page keeps retrying.
+- Host screen: "Team logins" table with Copy-message buttons, "Copy all", and "New password" per team
+  (stored on the host's device; the server only keeps a hash).
+- Room code is no longer shown in the page header; it is only needed at login (and shown in Team logins).
+- Failed logins are throttled (15 wrong tries / 5 min / IP).
+
+**6. Dead-connection retry.** If the first database read of a bid fails because the pooled connection is dead,
+the server discards it and retries once on a fresh one (nothing has been written yet, so no double bids).
+Verified on real PostgreSQL by terminating every pooled connection with `DB_POOL_PRE_PING=0`: the next bid
+was accepted and recorded exactly once. `DB_POOL_PRE_PING` stays ON by default (~70 ms per bid) — the retry
+is an extra safety net, not a reason to change the default.
+
+**Tests:** 58 pass on PostgreSQL 16 (pre-ping off), 56 pass + 2 skipped on SQLite. New: result pause, undo
+scenarios (Sanju/Jaiswal), login, throttling, legacy tokens, password reset, retry, dead PG connection.
+Two existing undo tests were updated because "Undo last player" now restores the last bid instead of
+re-queueing at base price.
+
+**Known limits:** a password reset does not drop a browser that is already connected (its next page load is
+refused); a team that opens the site on a new device needs its password again; the first Google-Fonts load
+needs internet.
