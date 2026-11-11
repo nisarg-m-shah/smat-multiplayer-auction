@@ -256,7 +256,8 @@ def required_amount(ctx: BidContext) -> int | None:
 
 
 def validate_bid(ctx: BidContext, amount: int, *, lot_id: int | None = None,
-                 player_id: int | None = None, franchise_id: int | None = None) -> int:
+                 player_id: int | None = None, franchise_id: int | None = None,
+                 received_at=None) -> int:
     """Pure validation against the latest committed state. Returns the required amount.
 
     Raises BidRejected(code, ...) with a distinguishable code; never adjusts `amount`.
@@ -278,8 +279,15 @@ def validate_bid(ctx: BidContext, amount: int, *, lot_id: int | None = None,
                           "That player has already been settled; a different player is now up.")
     if room.status != "LIVE" or lot.status != "LIVE":
         raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
-    if not lot.ends_at or seconds_until(lot.ends_at) <= 0:
-        raise BidRejected("TIMER_EXPIRED", "The bidding timer has expired")
+    # Judge expiry at the instant the request reached this server, not after DB
+    # authentication/locking/commit latency. A request received before the deadline
+    # remains eligible even if processing crosses zero.
+    bid_arrival = received_at or now_utc()
+    deadline = lot.ends_at
+    if deadline and deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    if not deadline or bid_arrival > deadline:
+        raise BidRejected("TIMER_EXPIRED", "The bidding timer had expired when your bid reached the server")
     if seconds_until(lot.ends_at) > room.timer_seconds + 0.05:
         # Still inside the pause that shows the previous player's result.
         raise BidRejected("PLAYER_NOT_STARTED", "The next player is about to start — bidding opens in a moment.")
@@ -550,8 +558,8 @@ def undo_last_sale(db: Session, room: Room):
 
 def undo_last_bid(db: Session, room: Room):
     lot = current_lot(db, room)
-    if not lot or lot.status != "LIVE":
-        raise ValueError("There is no live player with a bid to undo")
+    if not lot or lot.status not in ("LIVE", "PAUSED"):
+        raise ValueError("There is no current player with a bid to undo")
     last = db.scalar(select(Bid).where(
         Bid.lot_id == lot.id, Bid.active == True
     ).order_by(desc(Bid.sequence_no), desc(Bid.id)).limit(1))
@@ -574,15 +582,20 @@ def undo_last_bid(db: Session, room: Room):
         lot.current_bid = 0
         lot.highest_franchise_id = None
         lot.bid_sequence = 0
-    lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+    if room.status == "PAUSED" or lot.status == "PAUSED":
+        lot.status = "PAUSED"
+        lot.ends_at = None
+        lot.remaining_ms = room.timer_seconds * 1000
+    else:
+        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
     event(db, room.id, "BID_UNDONE", "Host removed the most recent bid.",
           {"removed_bid_id": last.id, "restored_bid_id": previous.id if previous else None})
     return last
 
 def redo_last_bid(db: Session, room: Room):
     lot = current_lot(db, room)
-    if not lot or lot.status != "LIVE" or room.status != "LIVE":
-        raise ValueError("A live player is required to redo a bid")
+    if not lot or lot.status not in ("LIVE", "PAUSED") or room.status not in ("LIVE", "PAUSED"):
+        raise ValueError("A current player is required to redo a bid")
     bid = db.scalar(select(Bid).where(
         Bid.room_id == room.id, Bid.lot_id == lot.id,
         Bid.active == False, Bid.redo_available == True
@@ -594,7 +607,12 @@ def redo_last_bid(db: Session, room: Room):
     lot.current_bid = bid.amount
     lot.highest_franchise_id = bid.franchise_id
     lot.bid_sequence = bid.sequence_no
-    lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+    if room.status == "PAUSED" or lot.status == "PAUSED":
+        lot.status = "PAUSED"
+        lot.ends_at = None
+        lot.remaining_ms = room.timer_seconds * 1000
+    else:
+        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
     franchise = db.get(Franchise, bid.franchise_id)
     event(db, room.id, "BID_REDONE", f"Host restored {franchise.name}'s bid of {bid.amount}.",
           {"restored_bid_id": bid.id, "franchise_id": franchise.id, "amount": bid.amount})
@@ -787,8 +805,8 @@ def snapshot(db: Session, room: Room):
         "recent_bids": [{"franchise": next((f.name for f in franchises if f.id == b.franchise_id), "?"),
                          "amount": b.amount, "sequence": b.sequence_no} for b in active_bids],
         "history": {
-            "can_undo_bid": bool(live and active_bids and room.status == "LIVE"),
-            "can_redo_bid": bool(live and room.status == "LIVE" and redoable_bid),
+            "can_undo_bid": bool(live and active_bids and room.status in ("LIVE", "PAUSED")),
+            "can_redo_bid": bool(live and room.status in ("LIVE", "PAUSED") and redoable_bid),
             "can_undo_sale": bool(room.status != "COMPLETED" and undoable_sale),
             "can_redo_sale": bool(room.status != "COMPLETED" and redoable_sale)
         }

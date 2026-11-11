@@ -70,16 +70,23 @@
             <h2 id="player-name">Waiting for player</h2><p id="player-team" class="muted"></p>
             <div class="price-row"><div><span class="muted">BASE PRICE</span><strong id="base-price">—</strong></div><div><span class="muted">CURRENT BID</span><strong id="current-bid">—</strong></div></div>
             <div class="timer" id="timer">—</div><div id="leading" class="leading">No bids yet</div>
+            <div id="current-bidder" class="current-bidder"><span class="bidder-label">CURRENT LEADER</span><strong id="current-bidder-name">No bidder yet</strong></div>
             <button id="bid-button" class="primary bid-button">Bid <span id="next-bid">—</span></button>
             <p id="bid-feedback" class="muted"></p>
           </div></div></div>
-          <div class="panel">
-            <div class="section-head"><h2>Franchises</h2><span class="muted">Live purse & squad</span></div><div id="franchises" class="franchise-grid"></div>
-          </div>
+
         </section>
-        <section class="lower-grid">
-          <div class="panel"><h2>Recent activity</h2><div id="activity"></div></div>
-          <div class="panel"><h2>Your squad</h2><div id="my-squad" class="muted">Select a franchise invite to view its squad.</div></div>
+        <section class="auction-tabs panel">
+          <div class="tab-bar" role="tablist" aria-label="Auction details">
+            <button class="auction-tab active" data-tab="franchises" role="tab" aria-selected="true">Franchises &amp; squads</button>
+            <button class="auction-tab" data-tab="activity" role="tab" aria-selected="false">Recent activity</button>
+          </div>
+          <div id="tab-franchises" class="tab-panel active" role="tabpanel">
+            <div class="section-head"><h2>Franchises</h2><span class="muted">Live purse &amp; squad</span></div>
+            <div id="my-squad-card" class="my-squad-card"><div class="my-squad-heading"><strong>YOUR SQUAD</strong><span id="my-squad-count" class="muted"></span></div><div id="my-squad" class="muted">Select a franchise invite to view its squad.</div></div>
+            <div id="franchises" class="franchise-grid"></div>
+          </div>
+          <div id="tab-activity" class="tab-panel" role="tabpanel" hidden><div class="section-head"><h2>Recent activity</h2><span class="muted">Latest auction events</span></div><div id="activity"></div></div>
         </section>
       </div>
       <section id="final-results" class="hidden">

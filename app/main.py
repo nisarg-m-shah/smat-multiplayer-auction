@@ -327,6 +327,10 @@ async def timer_supervisor(code, deadline=None):
         if deadline is None:
             return
         await asyncio.sleep(max(0.0, seconds_until(deadline)))
+        # Small arbitration window: a bid that reached the server just before the
+        # deadline must be able to acquire the room lock and commit before settlement.
+        # Eligibility is still decided from the request-arrival timestamp in validate_bid.
+        await asyncio.sleep(max(0.0, float(os.getenv("BID_DEADLINE_ARBITRATION_MS", "650"))) / 1000.0)
         # A new bid re-arms (cancels) this task. Once settlement has started it must run to
         # completion and publish its result, so it runs shielded from that cancellation.
         await asyncio.shield(_settle_and_rearm(code))
@@ -634,7 +638,7 @@ def _read_with_retry(db, fn, *args):
             pass
         return fn(*args)
 
-def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str):
+def _process_bid(code: str, authorization: str | None, req: BidRequest, request_id: str, received_at=None):
     """Authenticate, validate, write and COMMIT one bid; never touches a full snapshot.
 
     Returns (http_status, body, rearm_deadline). Round trips on the normal path (excluding the
@@ -665,7 +669,7 @@ def _process_bid(code: str, authorization: str | None, req: BidRequest, request_
                     ctx = _read_with_retry(db, load_bid_context, db, code, hashed)   # authenticate + read state (1 round trip)
                     t_read = time.perf_counter()
                     validate_bid(ctx, req.amount, lot_id=req.lot_id, player_id=req.player_id,
-                                 franchise_id=req.franchise_id)
+                                 franchise_id=req.franchise_id, received_at=received_at)
                     t_valid = time.perf_counter()
                     wrote = True
                     accepted = apply_bid(db, ctx, req.amount)
@@ -730,7 +734,8 @@ async def bid(code: str, payload: BidRequest, authorization: str | None = Header
     request_id = x_request_id if x_request_id and _REQUEST_ID.match(x_request_id) else uuid.uuid4().hex[:12]
     # SQLAlchemy uses a synchronous psycopg connection. Run the whole transaction
     # off the event loop so it cannot stall WebSockets, timers, or other bidders.
-    status, body, rearm = await asyncio.to_thread(_process_bid, code, authorization, payload, request_id)
+    received_at = now_utc()  # capture before DB work; deadline eligibility is based on arrival, not commit latency
+    status, body, rearm = await asyncio.to_thread(_process_bid, code, authorization, payload, request_id, received_at)
     if rearm is not None:
         arm_timer(code, rearm)   # accepted: new deadline; TIMER_EXPIRED: settle immediately
     if status == 200:
@@ -796,9 +801,9 @@ def _process_host_action(code: str, action: str, authorization: str | None):
 async def host_action(code: str, action: str, authorization: str | None = Header(default=None)):
     _ensure_loop()
     result = await asyncio.to_thread(_process_host_action, code, action, authorization)
-    if action in ("resume", "advance", "undo-bid", "redo-bid", "undo-sale", "redo-sale"):
+    if action in ("resume", "advance", "undo-bid", "redo-bid", "undo-sale", "redo-sale") and result.get("room", {}).get("status") == "LIVE":
         arm_timer(code)
-    elif action in ("pause", "finish"):
+    elif action in ("pause", "finish") or result.get("room", {}).get("status") == "PAUSED":
         task = timer_tasks.get(code.upper())
         if task:
             task.cancel()

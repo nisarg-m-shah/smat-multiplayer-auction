@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let roomCode=null, token=null, isHost=false, myFranchise=null, ws=null, state=null, pool=[], timerInterval=null, lastSnapshot=null;
 let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null;
+let serverClockOffsetMs=0, hasServerClockSample=false;
 let reconnectDelay=1000, reconnectTimer=null, heartbeatTimer=null;
 // Real-time sync state. `state` is the single source of truth in the browser; full snapshots replace
 // it, compact bid events patch it. Every message is ordered by the server's room version.
@@ -21,7 +22,13 @@ if(roomCode&&token){saveSession({room:roomCode.toUpperCase(),token});try{history
 else{const sess=loadSession();if(sess){roomCode=sess.room;token=sess.token}}
 const money=(n)=>Number(n||0).toLocaleString("en-IN");
 function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
-async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));if(!r.ok){const err=new Error(typeof d.detail==="string"?d.detail:"Request failed");err.status=r.status;throw err}return d}
+async function api(path,opts={}){const requestStarted=Date.now();const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));const responseReceived=Date.now();if(d?.server_time)syncServerClock(d.server_time,requestStarted,responseReceived);if(!r.ok){const err=new Error(typeof d.detail==="string"?d.detail:"Request failed");err.status=r.status;throw err}return d}
+function syncServerClock(serverTime,started=Date.now(),received=Date.now()){
+ const parsed=Date.parse(serverTime);if(!Number.isFinite(parsed))return;
+ const estimate=parsed-((started+received)/2);
+ serverClockOffsetMs=hasServerClockSample?(serverClockOffsetMs*.7+estimate*.3):estimate;
+ hasServerClockSample=true;
+}
 function show(id){$(id).classList.remove("hidden")} function hide(id){$(id).classList.add("hidden")}
 function message(text){$("bid-feedback").textContent=text}
 function roleText(){return isHost?(myFranchise?"Host · "+myFranchise.name:"Host (Administrator)"):(myFranchise?myFranchise.name:"Guest (view only)")}
@@ -77,6 +84,7 @@ async function render(s){
  // Concurrent bid responses can arrive out of order. Never let an older
  // committed room version overwrite a newer snapshot already rendered.
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
+ if(s.server_time)syncServerClock(s.server_time);
  state=s;lastSnapshot=s;bidFieldsVersion=0;
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
@@ -139,7 +147,10 @@ async function render(s){
   updateBidButton();
  }
  // Squad information must refresh even between players, immediately after a sale.
- $("my-squad").innerHTML=myFranchise?((s.franchises.find(f=>f.id===myFranchise.id)?.squad||[]).map(x=>`${esc(x.player)} — ${money(x.price)}`).join("<br>")||"No players purchased yet"):"Administrator view — choose a franchise under More host options to bid and see its squad.";
+ const ownSquad=myFranchise?(s.franchises.find(f=>Number(f.id)===Number(myFranchise.id))?.squad||[]):[];
+ const ownTeam=myFranchise?(s.franchises||[]).find(f=>Number(f.id)===Number(myFranchise.id)):null;
+ $("my-squad-count").textContent=ownTeam?`${ownTeam.squad_count}/${s.room.max_squad} players`:"HOST VIEW";
+ $("my-squad").innerHTML=myFranchise?(ownSquad.length?`<div class="my-squad-list">${ownSquad.map((x,i)=>`<div class="my-squad-player"><span class="squad-index">${String(i+1).padStart(2,"0")}</span><span class="squad-player-name">${esc(x.player)}<small>${esc(x.role||"PLAYER")}</small></span><strong>${money(x.price)}</strong></div>`).join("")}</div>`:`<div class="squad-empty">No players purchased yet.</div>`):"Administrator view — choose a franchise under More host options to bid and see its squad.";
  if(isHost){
   show("admin-controls");renderUnsold(s.unsold);
   const status=s.room.status;
@@ -267,7 +278,7 @@ function startLocalTimer(endsAt){
  if(!endsAt){$("timer").textContent="PAUSED";$("timer").classList.remove("urgent");return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>paintTimer(Math.max(0,(deadline-Date.now())/1000));
+ const update=()=>paintTimer(Math.max(0,(deadline-(Date.now()+serverClockOffsetMs))/1000));
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
@@ -290,6 +301,7 @@ function patchBidFields(p,e){
 // is still missing after GAP_WAIT_MS triggers the (expensive) full-snapshot recovery.
 const GAP_WAIT_MS=1500, pendingEvents=new Map();let gapTimer=null;
 function applyBidEvent(e){
+ if(e.server_time)syncServerClock(e.server_time);
  const v=Number(e.room_version), have=roomVersion();
  if(!state||!state.current_player){requestResync("no-state");return}
  if(v<=have)return;                                   // duplicate or older than what we already show
@@ -352,6 +364,8 @@ function paintBid(){
  const p=state?.current_player;if(!p)return;
  $("current-bid").textContent=money(p.current_bid||p.base_price);
  $("leading").textContent=p.highest_franchise?"Leading: "+p.highest_franchise:"No bids yet";
+ const bidder=$("current-bidder-name");if(bidder)bidder.textContent=p.highest_franchise||"No bidder yet";
+ const bidderBox=$("current-bidder");if(bidderBox)bidderBox.classList.toggle("has-bidder",!!p.highest_franchise);
  $("next-bid").textContent=money(p.next_bid);
  // Highlight the leader without rebuilding the franchise cards (keeps expanded squads open).
  document.querySelectorAll("#franchises details[data-franchise]").forEach(el=>
@@ -555,3 +569,9 @@ $("nominate").onclick=async()=>{
  catch(e){alert(e.message)}
 };
 init();
+
+// Switch the compact lower information area without scrolling between panels.
+document.querySelectorAll(".auction-tab").forEach(btn=>btn.addEventListener("click",()=>{
+ document.querySelectorAll(".auction-tab").forEach(b=>{const active=b===btn;b.classList.toggle("active",active);b.setAttribute("aria-selected",String(active))});
+ document.querySelectorAll(".tab-panel").forEach(panel=>{const active=panel.id===`tab-${btn.dataset.tab}`;panel.hidden=!active;panel.classList.toggle("active",active)});
+}));

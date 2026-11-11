@@ -108,3 +108,15 @@ re-queueing at base price.
 **Known limits:** a password reset does not drop a browser that is already connected (its next page load is
 refused); a team that opens the site on a new device needs its password again; the first Google-Fonts load
 needs internet.
+
+## v4 follow-up update (November 2026)
+
+**Paused-auction corrections.** Undo/redo bid now remains available when the room is PAUSED. The operation keeps the room and lot paused, clears the running deadline, and stores a full configured timer for the eventual resume. The host action endpoint cancels any outstanding timer supervisor when a correction leaves the room paused.
+
+**Last-second bid arbitration.** The bid endpoint captures the request-arrival timestamp before database work. Deadline eligibility is evaluated against that timestamp rather than the time after authentication, lock acquisition, and database writes. The timer supervisor waits an additional 650 ms arbitration window after the displayed deadline before attempting settlement, allowing a request received before the deadline to acquire the room lock. Requests that actually arrive after the deadline remain rejected. Tune with `BID_DEADLINE_ARBITRATION_MS` if needed.
+
+**Cross-device countdown alignment.** Browsers estimate server clock offset from server timestamps on snapshots and bid confirmations, then render the countdown against the corrected clock. This reduces clock-skew differences; network jitter can still cause small display differences.
+
+**Auction details layout.** Franchises and squads, including a premium own-squad card, now live in a two-tab section alongside Recent activity. The leading franchise is also named explicitly beside the bid controls, rather than relying only on the highlighted franchise card.
+
+**Validation:** `python -m pytest -q -rs` → 57 passed, 3 skipped (PostgreSQL-only and optional jsdom checks); `node --check app/static/app.js` and `python -m compileall -q app tests` passed. No live Render/Supabase or multi-device browser test was performed in this update.

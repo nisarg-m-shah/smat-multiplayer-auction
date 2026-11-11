@@ -172,3 +172,30 @@ def test_next_player_waits_for_result_pause_and_rejects_early_bids(monkeypatch):
     nxt.ends_at = now_utc() + timedelta(seconds=9.9)
     assert validate_bid(ctx, 20) == 20
     db.close()
+
+
+def test_bid_undo_redo_works_while_auction_is_paused():
+    from app.engine import pause_room, undo_last_bid, redo_last_bid
+    db, room, mi, csk, lot = make_auction()
+    place_bid(db, room, mi, 20); place_bid(db, room, csk, 30); db.commit()
+    pause_room(db, room); db.commit()
+    assert room.status == "PAUSED" and lot.status == "PAUSED"
+    undo_last_bid(db, room); db.commit()
+    assert room.status == "PAUSED" and lot.status == "PAUSED"
+    assert lot.ends_at is None and lot.remaining_ms == room.timer_seconds * 1000
+    assert (lot.current_bid, lot.highest_franchise_id) == (20, mi.id)
+    redo_last_bid(db, room); db.commit()
+    assert room.status == "PAUSED" and lot.status == "PAUSED"
+    assert lot.ends_at is None and lot.remaining_ms == room.timer_seconds * 1000
+    assert (lot.current_bid, lot.highest_franchise_id) == (30, csk.id)
+    db.close()
+
+
+def test_bid_arriving_before_deadline_is_valid_even_if_database_processing_crosses_it():
+    from app.engine import BidContext, validate_bid
+    db, room, mi, csk, lot = make_auction()
+    arrival = now_utc() - timedelta(milliseconds=100)
+    lot.ends_at = now_utc() - timedelta(milliseconds=20)
+    ctx = BidContext(room=room, lot=lot, franchise=mi, is_host=False)
+    assert validate_bid(ctx, 20, received_at=arrival) == 20
+    db.close()
