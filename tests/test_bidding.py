@@ -233,7 +233,7 @@ def test_f_no_bid_is_accepted_after_the_player_was_settled(client):
     old = a.current()
     assert a.bid("MI", 100).status_code == 200
     a.set_deadline(-1)
-    settled, nxt = main._settle_expired_lot(a.code)
+    settled, nxt, _hold = main._settle_expired_lot(a.code)
     assert settled and nxt is not None
     assert a.count(Sale) == 1 and a.purse("MI") == 4900
     # a late bid for the player who was just sold must fail and must not touch anything
@@ -259,7 +259,7 @@ def test_f_settlement_waits_for_an_in_flight_bid_and_then_sees_the_extended_time
         tb, ts = threading.Thread(target=bidder), threading.Thread(target=settler)
         tb.start(); time.sleep(0.05); ts.start(); tb.join(30); ts.join(30)
     assert out["bid"].status_code == 200, out["bid"].text
-    settled, deadline = out["settle"]
+    settled, deadline, _hold = out["settle"]
     assert settled is False and deadline is not None        # timer was extended by the committed bid
     room, lot = a.db_lot()
     assert lot.status == "LIVE" and lot.current_bid == 100

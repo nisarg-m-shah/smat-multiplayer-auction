@@ -5,6 +5,7 @@ from threading import RLock, Lock
 from sqlalchemy import select, desc, func, exists, and_, or_, update, insert, literal, true, JSON, Integer, Boolean, DateTime, String
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.orm.attributes import set_committed_value
+from . import config
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .seed import weighted_random_order
 
@@ -26,15 +27,6 @@ def lock_for(room_key):
 
 def now_utc():
     return datetime.now(timezone.utc)
-
-# After a player is settled the result banner is shown for a few seconds. The NEXT player's timer
-# starts only after that pause, so nobody can bid on (or even see) the next player under the banner.
-RESULT_PAUSE_SOLD = float(os.getenv("RESULT_PAUSE_SOLD_SECONDS", "4"))
-RESULT_PAUSE_UNSOLD = float(os.getenv("RESULT_PAUSE_UNSOLD_SECONDS", "3"))
-
-def result_pause_for(lot) -> float:
-    """Seconds the result banner is shown for a just-settled lot."""
-    return RESULT_PAUSE_SOLD if lot is not None and lot.status == "SOLD" else RESULT_PAUSE_UNSOLD
 
 def iso_utc(value):
     """UTC ISO-8601 with a trailing Z. SQLite may return naive datetimes; all deadlines are UTC."""
@@ -116,9 +108,7 @@ def create_queue(db: Session, room: Room, players: list[Player], round_no=1):
         db.add(Lot(room_id=room.id, player_id=p.id, round_no=round_no,
                    queue_order=offset+i, status="QUEUED", base_price=p.base_price))
 
-def open_next_lot(db: Session, room: Room, lead_in: float = 0.0):
-    """Open the next queued player. `lead_in` delays the start of its timer (result-banner pause):
-    ends_at = now + lead_in + timer, and bids are refused while more than `timer` seconds remain."""
+def open_next_lot(db: Session, room: Room):
     lot = db.scalar(select(Lot).where(
         Lot.room_id == room.id, Lot.status == "QUEUED"
     ).order_by(Lot.round_no, Lot.queue_order).limit(1))
@@ -131,7 +121,7 @@ def open_next_lot(db: Session, room: Room, lead_in: float = 0.0):
     lot.current_bid = 0
     lot.highest_franchise_id = None
     lot.bid_sequence = 0
-    lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds + max(0.0, lead_in))
+    lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
     lot.remaining_ms = None
     room.current_lot_id = lot.id
     room.status = "LIVE"
@@ -161,11 +151,11 @@ def settle_lot(db: Session, room: Room):
         db.add(sale)
         lot.status = "SOLD"
         event(db, room.id, "SOLD", f"{player.name} sold to {franchise.name} for {lot.current_bid}.",
-              {"player_id": player.id, "franchise_id": franchise.id, "franchise_name": franchise.name, "price": lot.current_bid})
+              {"player_id": player.id, "player_name": player.name, "franchise_id": franchise.id, "franchise_name": franchise.name, "price": lot.current_bid})
     else:
         player = db.get(Player, lot.player_id)
         lot.status = "UNSOLD"
-        event(db, room.id, "UNSOLD", f"{player.name} went unsold.", {"player_id": player.id})
+        event(db, room.id, "UNSOLD", f"{player.name} went unsold.", {"player_id": player.id, "player_name": player.name})
     lot.ends_at = None
     lot.settled_at = now_utc()
     lot.settlement_redo_available = False
@@ -279,18 +269,14 @@ def validate_bid(ctx: BidContext, amount: int, *, lot_id: int | None = None,
                           "That player has already been settled; a different player is now up.")
     if room.status != "LIVE" or lot.status != "LIVE":
         raise BidRejected("AUCTION_NOT_LIVE", "Bidding is not currently open")
-    # Judge expiry at the instant the request reached this server, not after DB
-    # authentication/locking/commit latency. A request received before the deadline
-    # remains eligible even if processing crosses zero.
-    bid_arrival = received_at or now_utc()
-    deadline = lot.ends_at
-    if deadline and deadline.tzinfo is None:
-        deadline = deadline.replace(tzinfo=timezone.utc)
-    if not deadline or bid_arrival > deadline:
-        raise BidRejected("TIMER_EXPIRED", "The bidding timer had expired when your bid reached the server")
-    if seconds_until(lot.ends_at) > room.timer_seconds + 0.05:
-        # Still inside the pause that shows the previous player's result.
-        raise BidRejected("PLAYER_NOT_STARTED", "The next player is about to start — bidding opens in a moment.")
+    if not lot.ends_at:
+        raise BidRejected("TIMER_EXPIRED", "The bidding timer has expired")
+    # Judge by ARRIVAL time (taken when the request reached the server) plus the grace window, so a bid
+    # pressed with a fraction of a second left is not lost to network or processing time.
+    ends = lot.ends_at if lot.ends_at.tzinfo else lot.ends_at.replace(tzinfo=timezone.utc)
+    ref = received_at or now_utc()
+    if (ends - ref).total_seconds() + config.BID_GRACE_SECONDS <= 0:
+        raise BidRejected("TIMER_EXPIRED", "The bidding timer has expired")
     if ctx.sold >= room.max_squad:
         raise BidRejected("SQUAD_FULL", "Your squad is already full")
     if lot.highest_franchise_id == franchise.id:
@@ -461,14 +447,16 @@ def host_advance(db: Session, room: Room):
             if lot:
                 lot.ends_at = now_utc()
                 settle_lot(db, room)
-                return open_next_lot(db, room, lead_in=result_pause_for(lot))
         return open_next_lot(db, room)
 
 def pause_room(db: Session, room: Room):
     if room.status != "LIVE":
         raise ValueError("Only a live auction can be paused")
     lot = current_lot(db, room)
-    lot.remaining_ms = max(0, int(seconds_until(lot.ends_at) * 1000))
+    # Pausing never leaves less than half the timer, so everyone has time to settle after the pause
+    # (lag, a fix, a reconnect) instead of resuming into the last second.
+    floor_ms = int(room.timer_seconds * 500)
+    lot.remaining_ms = max(floor_ms, int(seconds_until(lot.ends_at) * 1000))
     lot.ends_at = None
     lot.status = "PAUSED"
     room.status = "PAUSED"
@@ -482,20 +470,15 @@ def resume_room(db: Session, room: Room):
     lot.ends_at = now_utc() + timedelta(milliseconds=lot.remaining_ms or 1000)
     lot.remaining_ms = None
     room.status = "LIVE"
-    if lot.settlement_redo_available:
-        # A player restored by "Undo last player" is live again: re-selling the old result is no longer valid.
-        lot.settlement_redo_available = False
-        db.query(Sale).filter(Sale.lot_id == lot.id, Sale.redo_available == True).update(
-            {Sale.redo_available: False}, synchronize_session=False)
     event(db, room.id, "RESUMED", "Auction resumed.")
 
 def undo_last_sale(db: Session, room: Room):
-    """Undo the most recently settled player (sold OR unsold).
+    """Undo the most recently settled player, whether sold or unsold.
 
-    The player goes back on the block exactly as it was when the hammer fell: same highest bid, same
-    leader, same bid history (so "Undo last bid" still works). The room is PAUSED so the host can
-    check everything before resuming. Whoever was up next (even if already live with bids) is put
-    back at the FRONT of the queue and starts fresh after the restored player is settled again."""
+    The player is put straight back on the block EXACTLY where the hammer fell: same bids, same
+    highest bidder, same price, with a fresh timer. If the next player had already been opened
+    (or is paused on screen) that player is returned to the front of the queue, untouched by the
+    undo, and comes up next once the restored player has been settled again."""
     if room.status == "COMPLETED":
         raise ValueError("The auction has ended")
     lot = db.scalar(select(Lot).where(
@@ -505,14 +488,15 @@ def undo_last_sale(db: Session, room: Room):
     if not lot:
         raise ValueError("There is no settled player to undo")
     player = db.get(Player, lot.player_id)
+    was_paused = room.status == "PAUSED"
 
-    # 1) Park whoever is on the block now. Their queue position is untouched, and everything of theirs
-    #    is behind the restored player, so they come up next.
-    parked = None
+    # 1. A different player already on screen goes back to the front of the queue.
+    displaced = None
     if room.current_lot_id and room.current_lot_id != lot.id:
         cur = db.get(Lot, room.current_lot_id)
         if cur is not None and cur.status in ("LIVE", "PAUSED"):
-            for b in db.scalars(select(Bid).where(Bid.lot_id == cur.id, Bid.active == True)).all():  # noqa: E712
+            for b in db.scalars(select(Bid).where(Bid.lot_id == cur.id,
+                                (Bid.active == True) | (Bid.redo_available == True))).all():
                 b.active = False
                 b.redo_available = False
             cur.status = "QUEUED"
@@ -521,45 +505,63 @@ def undo_last_sale(db: Session, room: Room):
             cur.bid_sequence = 0
             cur.ends_at = None
             cur.remaining_ms = None
-            parked = db.get(Player, cur.player_id)
+            displaced = db.get(Player, cur.player_id)
+    db.flush()
 
-    # 2) Reverse the sale (refund) but KEEP the bids, then rebuild the lot state from the last active bid.
-    sale = db.scalar(select(Sale).where(Sale.lot_id == lot.id, Sale.reversed == False).order_by(desc(Sale.id)).limit(1))  # noqa: E712
+    # 2. Restore the settled player at his final bid.
+    sale = db.scalar(select(Sale).where(Sale.lot_id == lot.id, Sale.reversed == False).order_by(desc(Sale.id)).limit(1))
+    franchise = None
     if sale:
         franchise = db.get(Franchise, sale.franchise_id)
         franchise.purse_remaining += sale.price
         sale.reversed = True
         sale.redo_available = True
-    db.flush()
-    last = db.scalar(select(Bid).where(Bid.lot_id == lot.id, Bid.active == True)  # noqa: E712
-                     .order_by(desc(Bid.sequence_no), desc(Bid.id)).limit(1))
-    if last is not None:
-        lot.current_bid, lot.highest_franchise_id, lot.bid_sequence = last.amount, last.franchise_id, last.sequence_no
-    elif sale is not None:
-        lot.current_bid, lot.highest_franchise_id = sale.price, sale.franchise_id
-        lot.bid_sequence = lot.bid_sequence or 1
+        last_bid = db.scalar(select(Bid).where(Bid.lot_id == lot.id, Bid.active == True)
+                             .order_by(desc(Bid.sequence_no), desc(Bid.id)).limit(1))
+        lot.current_bid = sale.price
+        lot.highest_franchise_id = sale.franchise_id
+        lot.bid_sequence = last_bid.sequence_no if last_bid else 0
     else:
-        lot.current_bid, lot.highest_franchise_id, lot.bid_sequence = 0, None, 0
-    lot.status = "PAUSED"
-    lot.ends_at = None
-    lot.remaining_ms = room.timer_seconds * 1000
+        lot.current_bid = 0
+        lot.highest_franchise_id = None
+        lot.bid_sequence = 0
+    if was_paused:
+        lot.status = "PAUSED"
+        lot.ends_at = None
+        lot.remaining_ms = room.timer_seconds * 1000
+        room.status = "PAUSED"
+    else:
+        lot.status = "LIVE"
+        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+        lot.remaining_ms = None
+        room.status = "LIVE"
     lot.settlement_redo_available = True
     room.current_lot_id = lot.id
-    room.status = "PAUSED"
-    held = f"at {lot.current_bid}" if lot.highest_franchise_id else "with no bids"
-    event(db, room.id, "PLAYER_UNDONE",
-          f"Undo last player: {player.name} is back on the block {held} (paused)."
-          + (f" {parked.name} is next." if parked else ""),
+
+    msg = f"Undo last player: {player.name} is back on the block"
+    msg += f" at {sale.price} (last bid by {franchise.name})." if sale else " (previously unsold)."
+    if displaced is not None:
+        msg += f" {displaced.name} returns to the queue and is next."
+    event(db, room.id, "PLAYER_UNDONE", msg,
           {"lot_id": lot.id, "player_id": player.id, "was_sold": bool(sale),
-           "sale_id": sale.id if sale else None, "restored_bid": lot.current_bid,
-           "parked_player": parked.name if parked else None})
+           "sale_id": sale.id if sale else None,
+           "restored_price": sale.price if sale else 0,
+           "displaced_player": displaced.name if displaced is not None else None})
     db.flush()
     return lot
+
+def _reset_clock(room: Room, lot: Lot):
+    """Full timer after an undo/redo of a bid. A paused room stays paused: the full timer is held until resume."""
+    if lot.status == "PAUSED":
+        lot.ends_at = None
+        lot.remaining_ms = room.timer_seconds * 1000
+    else:
+        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
 
 def undo_last_bid(db: Session, room: Room):
     lot = current_lot(db, room)
     if not lot or lot.status not in ("LIVE", "PAUSED"):
-        raise ValueError("There is no current player with a bid to undo")
+        raise ValueError("There is no live player with a bid to undo")
     last = db.scalar(select(Bid).where(
         Bid.lot_id == lot.id, Bid.active == True
     ).order_by(desc(Bid.sequence_no), desc(Bid.id)).limit(1))
@@ -582,20 +584,15 @@ def undo_last_bid(db: Session, room: Room):
         lot.current_bid = 0
         lot.highest_franchise_id = None
         lot.bid_sequence = 0
-    if room.status == "PAUSED" or lot.status == "PAUSED":
-        lot.status = "PAUSED"
-        lot.ends_at = None
-        lot.remaining_ms = room.timer_seconds * 1000
-    else:
-        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+    _reset_clock(room, lot)
     event(db, room.id, "BID_UNDONE", "Host removed the most recent bid.",
           {"removed_bid_id": last.id, "restored_bid_id": previous.id if previous else None})
     return last
 
 def redo_last_bid(db: Session, room: Room):
     lot = current_lot(db, room)
-    if not lot or lot.status not in ("LIVE", "PAUSED") or room.status not in ("LIVE", "PAUSED"):
-        raise ValueError("A current player is required to redo a bid")
+    if not lot or lot.status not in ("LIVE", "PAUSED"):
+        raise ValueError("A live player is required to redo a bid")
     bid = db.scalar(select(Bid).where(
         Bid.room_id == room.id, Bid.lot_id == lot.id,
         Bid.active == False, Bid.redo_available == True
@@ -607,18 +604,20 @@ def redo_last_bid(db: Session, room: Room):
     lot.current_bid = bid.amount
     lot.highest_franchise_id = bid.franchise_id
     lot.bid_sequence = bid.sequence_no
-    if room.status == "PAUSED" or lot.status == "PAUSED":
-        lot.status = "PAUSED"
-        lot.ends_at = None
-        lot.remaining_ms = room.timer_seconds * 1000
-    else:
-        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+    _reset_clock(room, lot)
     franchise = db.get(Franchise, bid.franchise_id)
     event(db, room.id, "BID_REDONE", f"Host restored {franchise.name}'s bid of {bid.amount}.",
           {"restored_bid_id": bid.id, "franchise_id": franchise.id, "amount": bid.amount})
     db.flush()
     return bid
 
+
+def _redo_sale_still_valid(lot, sale) -> bool:
+    """A restored (live) player may only have his old sale re-applied while the bidding is
+    still exactly where it was when he was sold."""
+    if sale is not None:
+        return lot.current_bid == sale.price and lot.highest_franchise_id == sale.franchise_id
+    return (lot.current_bid or 0) == 0
 
 def redo_last_sale(db: Session, room: Room):
     """Redo the most recently undone settlement (sold OR unsold)."""
@@ -631,6 +630,8 @@ def redo_last_sale(db: Session, room: Room):
     if not lot:
         raise ValueError("There is no player available to redo")
     sale = db.scalar(select(Sale).where(Sale.lot_id == lot.id, Sale.reversed == True, Sale.redo_available == True).order_by(desc(Sale.id)).limit(1))
+    if lot.status in ("LIVE", "PAUSED") and not _redo_sale_still_valid(lot, sale):
+        raise ValueError("Bidding has moved on for this player, so the earlier sale can no longer be redone")
     if sale:
         franchise = db.get(Franchise, sale.franchise_id)
         if franchise.purse_remaining < sale.price:
@@ -736,6 +737,20 @@ def recover_interrupted_rooms(db: Session):
             event(db, room.id, "RECOVERY_REVIEW_REQUIRED",
                   "Server restarted; active lot needs host review before bidding can continue.")
         recovered.append(room.code)
+    # A restart during the sold/unsold hold must not leave the room stuck without a player.
+    # The next player is opened PAUSED so nothing starts ticking unattended.
+    for room in db.scalars(select(Room).where(Room.status == "BETWEEN_LOTS")).all():
+        lot = open_next_lot(db, room)
+        if lot is not None:
+            lot.status = "PAUSED"
+            lot.ends_at = None
+            lot.remaining_ms = room.timer_seconds * 1000
+            room.status = "PAUSED"
+            event(db, room.id, "RECOVERED_PAUSED",
+                  "Server restarted between players. The next player is ready and paused; resume starts a fresh timer.",
+                  {"lot_id": lot.id})
+        room.version += 1
+        recovered.append(room.code)
     db.commit()
     return recovered
 
@@ -758,7 +773,18 @@ def snapshot(db: Session, room: Room):
     active_bids = [b for b in bids if b.active]
     redoable_bid = any((not b.active) and b.redo_available for b in bids)
     undoable_sale = any(l.status in ("SOLD", "UNSOLD") and l.settled_at is not None for l in lots)
-    redoable_sale = any(l.settlement_redo_available and l.status in ("QUEUED", "LIVE", "PAUSED") for l in lots)
+    redoable_sale = False
+    for l in lots:
+        if not (l.settlement_redo_available and l.status in ("QUEUED", "LIVE", "PAUSED")):
+            continue
+        if l.status == "QUEUED":
+            redoable_sale = True
+            break
+        old_sale = db.scalar(select(Sale).where(Sale.lot_id == l.id, Sale.reversed == True,
+                                                Sale.redo_available == True).order_by(desc(Sale.id)).limit(1))
+        if _redo_sale_still_valid(l, old_sale):
+            redoable_sale = True
+            break
     sale_by_franchise = {}
     for s in sales:
         sale_by_franchise.setdefault(s.franchise_id, []).append({
@@ -773,7 +799,7 @@ def snapshot(db: Session, room: Room):
             "role": p.role, "state_team": p.state_team, "base_price": live.base_price,
             "current_bid": live.current_bid, "highest_franchise_id": live.highest_franchise_id,
             "highest_franchise": next((f.name for f in franchises if f.id == live.highest_franchise_id), None),
-            "ends_at": iso_utc(live.ends_at),
+            "ends_at": iso_utc(live.ends_at), "remaining_ms": live.remaining_ms,
             "status": live.status, "round_no": live.round_no,
             "next_bid": next_bid_amount(live)
         }

@@ -1,25 +1,46 @@
 import hashlib, secrets
 from .config import APP_SECRET
 
-# Passwords handed to franchises/host: easy to read out and type on a phone (no 0/O, 1/I/L).
-_PW_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-
 def new_token():
     return secrets.token_urlsafe(32)
 
-def new_password() -> str:
-    """10 characters (~49 bits), shown as XXXXX-XXXXX. Used as the bearer credential."""
-    raw = "".join(secrets.choice(_PW_ALPHABET) for _ in range(10))
-    return raw[:5] + "-" + raw[5:]
-
-def normalize_credential(value: str) -> str:
-    """Typed passwords are forgiving about case, spaces and the dash. Legacy long invite tokens
-    (case-sensitive, 43 chars) are returned untouched."""
-    value = (value or "").strip()
-    if len(value) <= 20:
-        return value.replace("-", "").replace(" ", "").upper()
-    return value
-
 def token_hash(token: str) -> str:
-    # Hash credentials before storing them. The raw value is only shown at room creation.
-    return hashlib.sha256((APP_SECRET + normalize_credential(token)).encode("utf-8")).hexdigest()
+    # Hash invite tokens before storing them. The raw token is only shown at room creation.
+    return hashlib.sha256((APP_SECRET + token).encode("utf-8")).hexdigest()
+
+# ---- name + password login -------------------------------------------------------------------
+# A franchise's bearer token is DERIVED from a per-record random nonce (HMAC with APP_SECRET), so a
+# correct login can re-issue the very same token on any device without the raw token being stored.
+# The bid hot path is unchanged: it still authenticates by token_hash(token) exactly as before.
+import hmac, base64
+
+_PW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no 0/O/1/I/L: easy to read out over a call
+_PBKDF2_ROUNDS = 120_000
+
+def new_nonce() -> str:
+    return secrets.token_hex(16)
+
+def derive_token(kind: str, nonce: str) -> str:
+    mac = hmac.new(APP_SECRET.encode("utf-8"), f"{kind}:{nonce}".encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode("ascii").rstrip("=")
+
+def new_password() -> str:
+    raw = "".join(secrets.choice(_PW_ALPHABET) for _ in range(8))
+    return raw[:4] + "-" + raw[4:]
+
+def _norm_pw(password: str) -> str:
+    return "".join(str(password).upper().split()).replace("-", "")
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(8)
+    dk = hashlib.pbkdf2_hmac("sha256", _norm_pw(password).encode(), salt.encode(), _PBKDF2_ROUNDS)
+    return f"{salt}${dk.hex()}"
+
+def check_password(password: str, stored: str | None) -> bool:
+    if not stored or "$" not in stored:
+        # still burn comparable time so a missing password is not distinguishable by timing
+        hashlib.pbkdf2_hmac("sha256", b"x", b"x", _PBKDF2_ROUNDS)
+        return False
+    salt, want = stored.split("$", 1)
+    dk = hashlib.pbkdf2_hmac("sha256", _norm_pw(password).encode(), salt.encode(), _PBKDF2_ROUNDS)
+    return hmac.compare_digest(dk.hex(), want)

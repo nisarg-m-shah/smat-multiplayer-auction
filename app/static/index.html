@@ -1,103 +1,192 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#07070a">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#07080d">
 <title>SMAT Auction Room</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Oswald:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="preload" href="/static/fonts/barlow-condensed-latin-800-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<div class="bg-glow" aria-hidden="true"></div>
 <div id="app">
-  <header><div><span class="ball" aria-hidden="true"></span><div><div class="eyebrow">PRIVATE MULTIPLAYER AUCTION</div><h1>SMAT Auction Room</h1></div></div><div id="connection" class="pill">Not connected</div></header>
+
+  <!-- ───────── top bar ───────── -->
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="SMAT Auction home">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+        <defs><linearGradient id="bm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset=".6" stop-color="#f97316"/><stop offset="1" stop-color="#ea580c"/></linearGradient></defs>
+        <circle cx="20" cy="20" r="18" fill="url(#bm)"/>
+        <path d="M7.5 12.5c6 3.5 6 12.5 0 16M32.5 11.5c-6 3.5-6 13.5 0 17" fill="none" stroke="#fff" stroke-opacity=".85" stroke-width="2" stroke-linecap="round" stroke-dasharray="2.6 3.4"/>
+        <path d="M13 27l9-9m-2.5-3.5l5 5m-1.5-6.5l-5 3m11 4l-3 5" fill="none" stroke="#1a1206" stroke-width="2.4" stroke-linecap="round" opacity=".0"/>
+      </svg>
+      <span class="brand-text"><span class="eyebrow">PRIVATE MULTIPLAYER AUCTION</span><span class="brand-name">SMAT <em>Auction</em></span></span>
+    </a>
+    <div class="topbar-right">
+      <div id="me-chip" class="me-chip hidden"></div>
+      <span id="role-label" class="role-pill hidden"></span>
+      <div id="connection" class="conn" data-state="off"><i class="dot"></i><span id="connection-text">Not connected</span></div>
+      <button id="logout-btn" class="ghost small hidden" type="button">Sign out</button>
+    </div>
+  </header>
+
   <main>
-    <section id="login" class="panel hidden">
-      <div class="eyebrow">WELCOME</div>
-      <h2>Join the auction</h2>
-      <p class="muted">Enter the room code and the password the host sent you. You stay signed in on this device, even if your connection drops.</p>
-      <form id="login-form">
-        <label>Room code<input id="login-room" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="e.g. K7M2QX" required></label>
-        <label>Your team<select id="login-team" required disabled><option value="">Enter the room code first</option></select></label>
-        <label>Password<input id="login-password" type="password" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="XXXXX-XXXXX" required></label>
-        <label class="check"><input id="login-show" type="checkbox"> Show password</label>
-        <p id="login-error" class="form-error hidden" role="alert"></p>
-        <button class="primary" id="login-submit">Join auction</button>
-      </form>
-      <button id="show-create" type="button" class="link-button">Hosting a new auction? Create one</button>
-    </section>
-    <section id="landing" class="panel hidden">
-      <h2>Create a private auction</h2>
-      <p class="muted">The host creates the room, then sends each franchise its team name, a short password and the room code.</p>
-      <form id="create-form">
-        <label>Auction name<input name="name" value="SMAT Auction" required></label>
-        <label>Franchise names <textarea name="franchises" rows="4" placeholder="One franchise per line&#10;Mumbai Mavericks&#10;Coastal Kings" required></textarea></label>
-        <div class="grid two">
-          <label>Starting purse<input name="purse" type="number" value="5000" min="100"></label>
-          <label>Timer<select name="timer_seconds"><option>5</option><option selected>10</option><option>25</option></select></label>
-          <label>Minimum squad<input name="min_squad" type="number" value="18" min="1"></label>
-          <label>Maximum squad<input name="max_squad" type="number" value="25" min="1"></label>
+    <!-- ───────── landing: join / host ───────── -->
+    <section id="landing" class="landing">
+      <div class="hero">
+        <div class="eyebrow live"><i class="dot"></i> LIVE · REAL-TIME · PRIVATE</div>
+        <h1>Bid. Build.<br><span class="grad">Own the season.</span></h1>
+        <p class="lead">A private, server-timed auction room for your franchise league. Every bid is confirmed by the server and appears on every screen the moment it lands.</p>
+        <ul class="hero-points">
+          <li><b>Exact-price bidding</b><span>No surprise amounts. You bid what you see.</span></li>
+          <li><b>Stays signed in</b><span>Drop off Wi-Fi mid-auction and you are right back in.</span></li>
+          <li><b>Host in control</b><span>Pause, undo and resume without losing the lot.</span></li>
+        </ul>
+      </div>
+      <div class="panel auth-card">
+        <div class="tabs" role="tablist">
+          <button id="tab-join" class="tab active" type="button" role="tab" data-tab="join">Join auction</button>
+          <button id="tab-create" class="tab" type="button" role="tab" data-tab="create">Host an auction</button>
         </div>
-        <label class="check"><input type="checkbox" name="bid_extension" checked> Extend timer when a bid arrives</label>
-        <button class="primary">Create room</button>
-      </form>
-      <button id="show-login" type="button" class="link-button">Already have a password? Join an auction</button>
-      <div class="note">Player data is loaded from <code>Auction.py</code> if the file is placed in the configured data folder. Otherwise, you can import a CSV in the pool manager.</div>
+
+        <form id="login-form" class="tab-pane" autocomplete="on">
+          <p class="muted">Use the room code, franchise name and password your host sent you.</p>
+          <label>Room code<input id="login-room" name="room" class="code-input" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="ABC123" required></label>
+          <label>Franchise<input id="login-franchise" name="franchise" list="login-franchise-list" autocomplete="username" placeholder="Your franchise name" required><datalist id="login-franchise-list"></datalist></label>
+          <label>Password<input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Password from your host" required></label>
+          <div id="login-error" class="form-error hidden" role="alert"></div>
+          <button class="primary wide" id="login-submit">Enter the auction</button>
+        </form>
+
+        <form id="create-form" class="tab-pane hidden">
+          <label>Auction name<input name="name" value="SMAT Auction" required></label>
+          <label>Franchise names <textarea name="franchises" rows="4" placeholder="One franchise per line&#10;Mumbai Mavericks&#10;Coastal Kings" required></textarea></label>
+          <div class="grid two">
+            <label>Starting purse<input name="purse" type="number" value="5000" min="100"></label>
+            <label>Timer<select name="timer_seconds"><option>5</option><option selected>10</option><option>25</option></select></label>
+            <label>Minimum squad<input name="min_squad" type="number" value="18" min="1"></label>
+            <label>Maximum squad<input name="max_squad" type="number" value="25" min="1"></label>
+          </div>
+          <label class="check"><input type="checkbox" name="bid_extension" checked><span>Extend timer when a bid arrives</span></label>
+          <button class="primary wide">Create room</button>
+          <p class="note">Player data loads from <code>Auction.py</code> in the data folder. Otherwise import a CSV in the pool manager.</p>
+        </form>
+      </div>
     </section>
-    <section id="invite-output" class="panel hidden"></section>
+
+    <!-- ───────── room ───────── -->
     <section id="room" class="hidden">
-      <div class="roombar panel"><div class="who"><span class="eyebrow">SIGNED IN AS</span><strong id="role-label"></strong></div><button id="logout" class="secondary" type="button">Log out</button></div>
+
+      <!-- credentials shown right after a room is created -->
+      <section id="invite-output" class="panel hidden"></section>
+
+      <!-- host: pool management before the auction starts -->
       <div id="host-setup" class="panel hidden">
-        <div class="section-head"><div><h2>Auction pool management</h2><p class="muted">Remove players who should not be available. Higher importance weight means a better chance of appearing earlier.</p></div><button id="start-auction" class="primary">Lock pool & start</button></div>
+        <div class="section-head">
+          <div><h2>Auction pool</h2><p class="muted">Remove players who should not be available. A higher importance weight means a better chance of appearing earlier.</p></div>
+          <button id="start-auction" class="primary">Lock pool &amp; start</button>
+        </div>
         <div class="host-franchise-picker"><label>My franchise (host participation)<select id="host-franchise-setup"><option value="">Host only — not bidding</option></select></label><p class="muted">Choose the franchise you will manage and bid for. This choice locks when the auction starts.</p></div>
+        <div id="invite-list" class="access-block"></div>
         <div class="toolbar"><input id="pool-search" placeholder="Search player, state team or role"><label class="upload">Import CSV<input id="csv-upload" type="file" accept=".csv"></label></div>
         <div id="pool-table" class="table-wrap"></div>
-        <details><summary>Add a player manually</summary><form id="add-player" class="inline-form"><input name="name" placeholder="Player name" required><input name="state_team" placeholder="State team"><select name="role"><option>BAT</option><option>AR</option><option>BOWL</option><option>WK</option><option>UNKNOWN</option></select><input name="base_price" type="number" value="20"><input name="importance_weight" type="number" min="0.01" step="0.1" value="1"><button class="secondary">Add</button></form></details>
+        <details class="add-player"><summary>Add a player manually</summary><form id="add-player" class="inline-form"><input name="name" placeholder="Player name" required><input name="state_team" placeholder="State team"><select name="role"><option>BAT</option><option>AR</option><option>BOWL</option><option>WK</option><option>UNKNOWN</option></select><input name="base_price" type="number" value="20"><input name="importance_weight" type="number" min="0.01" step="0.1" value="1"><button class="secondary">Add</button></form></details>
       </div>
-      <div id="live-area" class="hidden">
-        <section id="admin-controls" class="panel hidden"><div class="section-head"><h2>Host controls</h2><span class="muted">Quick actions</span></div>
-          <div class="button-row"><button data-action="pause" class="secondary">Pause</button><button data-action="resume" class="secondary">Resume</button><button data-action="undo-bid" class="secondary">Undo last bid</button><button data-action="redo-bid" class="secondary">Redo last bid</button><button data-action="undo-sale" class="danger">Undo last player</button><button data-action="redo-sale" class="secondary">Redo last player</button><button data-action="finish" class="danger">End auction</button></div>
-          <details class="host-more"><summary>More host options</summary>
-            <div class="host-franchise-picker creds-picker"><button id="show-creds" type="button" class="secondary">Show team logins &amp; reset passwords</button><div id="creds-box" class="hidden"></div></div>
-            <div class="host-franchise-picker"><label>My franchise<select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
-            <div class="nomination"><h3>Unsold-only round</h3><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players & start unsold-only round</button></div>
-          </details>
-        </section>
-        <section class="auction-grid">
-          <div class="panel player-panel">
-            <div class="timer-bar" aria-hidden="true"><i id="timer-fill"></i></div><div class="player-body"><div id="intermission" class="intermission hidden"><div class="eyebrow">UP NEXT</div><h2>Next player coming up…</h2></div><div id="player-main">
-            <div class="eyebrow" id="round-label">ROUND 1</div><div id="player-role" class="tag">PLAYER</div>
-            <h2 id="player-name">Waiting for player</h2><p id="player-team" class="muted"></p>
-            <div class="price-row"><div><span class="muted">BASE PRICE</span><strong id="base-price">—</strong></div><div><span class="muted">CURRENT BID</span><strong id="current-bid">—</strong></div></div>
-            <div class="timer" id="timer">—</div><div id="leading" class="leading">No bids yet</div>
-            <div id="current-bidder" class="current-bidder"><span class="bidder-label">CURRENT LEADER</span><strong id="current-bidder-name">No bidder yet</strong></div>
-            <button id="bid-button" class="primary bid-button">Bid <span id="next-bid">—</span></button>
-            <p id="bid-feedback" class="muted"></p>
-          </div></div></div>
 
+      <div id="live-area" class="hidden">
+
+        <!-- host controls: right above the bidding so they are one tap away -->
+        <section id="host-bar" class="host-bar hidden" aria-label="Host controls">
+          <div class="host-bar-head"><span class="host-tag">HOST</span><span id="room-status" class="status-pill" data-status="">—</span></div>
+          <div class="button-row">
+            <button data-action="pause" class="ctl">Pause</button>
+            <button data-action="resume" class="ctl go">Resume</button>
+            <button data-action="undo-bid" class="ctl">Undo <span class="opt">last </span>bid</button>
+            <button data-action="redo-bid" class="ctl">Redo <span class="opt">last </span>bid</button>
+            <button data-action="undo-sale" class="ctl warn">Undo <span class="opt">last </span>player</button>
+            <button data-action="redo-sale" class="ctl">Redo <span class="opt">last </span>player</button>
+            <button data-action="finish" class="ctl danger">End auction</button>
+          </div>
         </section>
-        <section class="auction-tabs panel">
-          <div class="tab-bar" role="tablist" aria-label="Auction details">
-            <button class="auction-tab active" data-tab="franchises" role="tab" aria-selected="true">Franchises &amp; squads</button>
-            <button class="auction-tab" data-tab="activity" role="tab" aria-selected="false">Recent activity</button>
+
+        <section class="auction-grid">
+          <div class="panel player-panel" id="player-panel">
+            <div class="timer-bar" aria-hidden="true"><i id="timer-fill"></i></div>
+
+            <div class="card-head">
+              <span class="live-chip"><i class="dot"></i><span id="round-label">ROUND 1</span></span>
+              <span id="queue-label" class="muted"></span>
+            </div>
+
+            <!-- live bidding -->
+            <div id="bid-stage" class="bid-stage">
+              <div class="player-top">
+                <div class="player-meta"><span id="player-role" class="role-chip" data-role="">PLAYER</span><span id="player-team" class="state-chip"></span></div>
+                <h2 id="player-name">Waiting for player</h2>
+              </div>
+              <div class="price-grid">
+                <div class="stat base"><span class="lbl">Base price</span><strong id="base-price">—</strong></div>
+                <div class="stat hero"><span class="lbl">Current bid</span><strong id="current-bid">—</strong></div>
+                <div class="timer-box" id="timer-box" data-state="idle"><div id="timer">—</div><span class="unit">SEC</span></div>
+              </div>
+              <div id="leading" class="leading" aria-live="polite">
+                <span id="leader-badge" class="leader-badge" aria-hidden="true"></span>
+                <span class="leader-text"><small id="leader-label">Highest bidder</small><b id="leader-name">No bids yet</b></span>
+                <span id="leader-you" class="chip you hidden">You</span>
+              </div>
+              <div class="bid-dock" id="bid-dock">
+                <button id="bid-button" class="primary bid-button"><span class="bid-label" id="bid-label">Place bid</span><span class="bid-amt"><span id="next-bid">—</span></span></button>
+              </div>
+              <p id="bid-feedback" class="feedback"></p>
+            </div>
+
+            <!-- sold / unsold: replaces the bidding area until the next player opens -->
+            <div id="result-stage" class="result-stage hidden" aria-live="polite">
+              <div id="result-confetti" class="confetti-layer" aria-hidden="true"></div>
+              <div class="result-inner">
+                <div id="result-tag" class="result-tag">SOLD</div>
+                <h3 id="result-player"></h3>
+                <div id="result-price" class="result-price"></div>
+                <div id="result-buyer" class="result-buyer"></div>
+                <div class="result-next"><i class="dot"></i>Next player coming up…</div>
+              </div>
+            </div>
           </div>
-          <div id="tab-franchises" class="tab-panel active" role="tabpanel">
-            <div class="section-head"><h2>Franchises</h2><span class="muted">Live purse &amp; squad</span></div>
-            <div id="my-squad-card" class="my-squad-card"><div class="my-squad-heading"><strong>YOUR SQUAD</strong><span id="my-squad-count" class="muted"></span></div><div id="my-squad" class="muted">Select a franchise invite to view its squad.</div></div>
-            <div id="franchises" class="franchise-grid"></div>
+
+          <div class="panel side-panel" id="side-panel">
+            <div class="side-tabs" role="tablist" aria-label="Auction details">
+              <button class="side-tab active" type="button" role="tab" data-side="franchises" aria-selected="true">Franchises <span class="count" id="tab-count-f"></span></button>
+              <button class="side-tab" type="button" role="tab" data-side="activity" aria-selected="false">Activity</button>
+            </div>
+            <div id="pane-franchises" class="side-pane" role="tabpanel">
+              <div id="my-squad"></div>
+              <div id="franchises-title" class="subhead hidden">Other franchises</div>
+              <div id="franchises" class="franchise-grid"></div>
+            </div>
+            <div id="pane-activity" class="side-pane hidden" role="tabpanel">
+              <div id="activity" class="activity"></div>
+            </div>
           </div>
-          <div id="tab-activity" class="tab-panel" role="tabpanel" hidden><div class="section-head"><h2>Recent activity</h2><span class="muted">Latest auction events</span></div><div id="activity"></div></div>
+        </section>
+
+        <section id="admin-controls" class="panel hidden">
+          <div class="section-head"><h2>More host tools</h2><span class="muted">Host can also manage a franchise</span></div>
+          <div class="host-franchise-picker"><label>My franchise<select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
+          <div class="nomination"><h3>Unsold-only round</h3><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players &amp; start unsold-only round</button></div>
+          <div id="access-live" class="access-block"></div>
         </section>
       </div>
+
       <section id="final-results" class="hidden">
-        <div class="final-hero panel"><div class="eyebrow">SMAT AUCTION</div><h2>AUCTION COMPLETED</h2><p class="muted">The auction has officially ended. Here is the final franchise-wise squad breakdown.</p></div>
+        <div class="final-hero panel"><div class="eyebrow">SMAT AUCTION</div><h2>Auction completed</h2><p class="muted">The auction has officially ended. Here is the final franchise-wise squad breakdown.</p></div>
         <div id="final-summary" class="final-summary-grid"></div>
         <div id="final-franchises" class="final-franchise-grid"></div>
       </section>
     </section>
   </main>
-  <div id="celebration" class="celebration hidden" aria-live="polite"><div class="celebration-card"><div id="celebration-title"></div><div id="celebration-detail"></div></div><div id="confetti-layer"></div></div>
   <footer>Private room · Server-controlled bidding · No real-money transactions</footer>
 </div>
 <script src="/static/app.js"></script>
-</body></html>
+</body>
+</html>

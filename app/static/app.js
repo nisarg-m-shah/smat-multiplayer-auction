@@ -1,91 +1,106 @@
 const $ = (id) => document.getElementById(id);
 let roomCode=null, token=null, isHost=false, myFranchise=null, ws=null, state=null, pool=[], timerInterval=null, lastSnapshot=null;
 let hasInitialSnapshot=false, lastCelebrationEventId=null, audioContext=null;
-let serverClockOffsetMs=0, hasServerClockSample=false;
 let reconnectDelay=1000, reconnectTimer=null, heartbeatTimer=null;
 // Real-time sync state. `state` is the single source of truth in the browser; full snapshots replace
 // it, compact bid events patch it. Every message is ordered by the server's room version.
 let bidInFlight=false, armedBid=null, resyncing=false, bidFieldsVersion=0;
 window.__bidStats=[];
-// ---- session: team + password login, kept on this device -------------------------------------
-// The browser keeps the credential (sessionStorage per tab, localStorage as a fallback) so reloads,
-// lost connections and closed tabs never sign anyone out. Only an explicit "Log out" or a password
-// the host has reset clears it.
-const SKEY="smat_session";
-const store=(w)=>{try{return window[w]}catch(e){return null}};
-function saveSession(s){for(const w of ["sessionStorage","localStorage"]){try{store(w)?.setItem(SKEY,JSON.stringify(s))}catch(e){}}}
-function loadSession(){for(const w of ["sessionStorage","localStorage"]){try{const v=store(w)?.getItem(SKEY);if(v){const o=JSON.parse(v);if(o&&o.room&&o.token)return o}}catch(e){}}return null}
-function clearSession(){for(const w of ["sessionStorage","localStorage"]){try{store(w)?.removeItem(SKEY)}catch(e){}}}
+// ---- session: survives refreshes, closed tabs and dropped connections ---------------------------
+// Only an explicit sign-out, or the server answering 401 (password reset / bad token), ends a session.
+// A network failure never does.
+const SESSION_KEY="smat.session";
+function saveSession(){try{localStorage.setItem(SESSION_KEY,JSON.stringify({room:roomCode,token}))}catch(e){}}
+function loadSession(){try{const s=JSON.parse(localStorage.getItem(SESSION_KEY)||"null");return s&&s.room&&s.token?s:null}catch(e){return null}}
+function clearSession(){try{localStorage.removeItem(SESSION_KEY)}catch(e){}}
 const params=new URLSearchParams(location.search);
 roomCode=params.get("room"); token=params.get("token");
-if(roomCode&&token){saveSession({room:roomCode.toUpperCase(),token});try{history.replaceState({},"",location.pathname)}catch(e){}}   // direct-login links still work
-else{const sess=loadSession();if(sess){roomCode=sess.room;token=sess.token}}
+if(roomCode&&token){saveSession();history.replaceState({},"","/")}      // old invite links still work, then tidy the URL
+else{const s=loadSession();if(s){roomCode=s.room;token=s.token}else{roomCode=null;token=null}}
+class AuthError extends Error{}
 const money=(n)=>Number(n||0).toLocaleString("en-IN");
-function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
-async function api(path,opts={}){const requestStarted=Date.now();const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));const responseReceived=Date.now();if(d?.server_time)syncServerClock(d.server_time,requestStarted,responseReceived);if(!r.ok){const err=new Error(typeof d.detail==="string"?d.detail:"Request failed");err.status=r.status;throw err}return d}
-function syncServerClock(serverTime,started=Date.now(),received=Date.now()){
- const parsed=Date.parse(serverTime);if(!Number.isFinite(parsed))return;
- const estimate=parsed-((started+received)/2);
- serverClockOffsetMs=hasServerClockSample?(serverClockOffsetMs*.7+estimate*.3):estimate;
- hasServerClockSample=true;
+// ---- design helpers: franchise monogram badges, role labels, activity icons ------------------
+const PALETTE=[["#2563eb","#1e3a8a","#fff"],["#fcd34d","#d97706","#2b1a00"],["#ef4444","#991b1b","#fff"],["#8b5cf6","#4c1d95","#fff"],
+ ["#0ea5e9","#0369a1","#fff"],["#ec4899","#9d174d","#fff"],["#fb923c","#c2410c","#fff"],["#4c63b6","#1b2557","#fff"],["#be185d","#6b0f3a","#fff"],["#10b981","#047857","#fff"]];
+let franchiseOrder=[];
+function initials(name){const w=String(name||"?").trim().split(/\s+/).filter(Boolean);return(w.length>1?w[0][0]+w[1][0]:String(name||"?").trim().slice(0,3)).toUpperCase()}
+function badgeHTML(name,id){
+ let i=franchiseOrder.indexOf(Number(id));if(i<0){i=0;for(const c of String(name))i=(i*31+c.charCodeAt(0))>>>0}
+ const [a,b,f]=PALETTE[i%PALETTE.length];
+ return `<span class="badge" style="--b1:${a};--b2:${b};--bf:${f}">${esc(initials(name))}</span>`;
 }
+const ROLE_LABELS={BAT:"Batter",BOWL:"Bowler",AR:"All-Rounder",WK:"Wicket-Keeper"};
+const roleLabel=(r)=>ROLE_LABELS[String(r||"").toUpperCase()]||String(r||"Player");
+const ICON=(p)=>`<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
+const ICONS={
+ BID:ICON('<path d="m14 13-8.5 8.5a2.12 2.12 0 0 1-3-3L11 10"/><path d="m16 16 6-6"/><path d="m8 8 6-6"/><path d="m9 7 8 8"/><path d="m21 11-8-8"/>'),
+ SOLD:ICON('<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>'),
+ UNSOLD:ICON('<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6m0-6-6 6"/>'),
+ UNDO:ICON('<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>'),
+ REDO:ICON('<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>'),
+ PAUSE:ICON('<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>'),
+ PLAY:ICON('<path d="m7 4 13 8-13 8z"/>'),
+ INFO:ICON('<circle cx="12" cy="12" r="4"/>')
+};
+const EVENT_ICON={BID:"BID",SOLD:"SOLD",UNSOLD:"UNSOLD",BID_UNDONE:"UNDO",PLAYER_UNDONE:"UNDO",BID_REDONE:"REDO",PLAYER_REDONE:"REDO",PAUSED:"PAUSE",RECOVERED_PAUSED:"PAUSE",RESUMED:"PLAY"};
+function activityHTML(e){
+ const k=String(e.kind||"").toLowerCase();
+ return `<div class="activity-item ev-${k}">${ICONS[EVENT_ICON[e.kind]||"INFO"]}<span>${esc(e.message)}</span></div>`;
+}
+function setConnection(text,st){const c=$("connection");if(!c)return;c.dataset.state=st||"off";$("connection-text").textContent=text}
+function auth(){return {"Authorization":"Bearer "+token,"Content-Type":"application/json"}}
+async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}});let d=await r.json().catch(()=>({}));if(!r.ok){const m=typeof d.detail==="string"?d.detail:"Request failed";throw (r.status===401?new AuthError(m):new Error(m))}return d}
 function show(id){$(id).classList.remove("hidden")} function hide(id){$(id).classList.add("hidden")}
 function message(text){$("bid-feedback").textContent=text}
-function roleText(){return isHost?(myFranchise?"Host · "+myFranchise.name:"Host (Administrator)"):(myFranchise?myFranchise.name:"Guest (view only)")}
-function showLogin(msg){
- hide("room");hide("landing");show("login");
- const last=(()=>{try{return localStorage.getItem("smat_last_room")||""}catch(e){return ""}})();
- if(last&&!$("login-room").value){$("login-room").value=last;loadTeams()}
- const err=$("login-error");if(msg){err.textContent=msg;err.classList.remove("hidden")}else err.classList.add("hidden");
-}
-let teamsFor="";
-async function loadTeams(){
- const code=$("login-room").value.trim().toUpperCase(),sel=$("login-team"),err=$("login-error");
- if(code.length<4){sel.disabled=true;sel.innerHTML='<option value="">Enter the room code first</option>';teamsFor="";return}
- if(code===teamsFor)return;
- try{
-  const r=await fetch(`/api/rooms/${encodeURIComponent(code)}/teams`);const d=await r.json().catch(()=>({}));
-  if(!r.ok)throw new Error(d.detail||"No auction found with that room code");
-  teamsFor=code;err.classList.add("hidden");
-  sel.innerHTML='<option value="">Choose your team…</option>'+d.teams.map(t=>`<option value="${t.id}">${esc(t.name)}</option>`).join("")+'<option value="host">Host (administrator)</option>';
-  sel.disabled=false;
- }catch(e){teamsFor="";sel.disabled=true;sel.innerHTML='<option value="">—</option>';err.textContent=e.message;err.classList.remove("hidden")}
-}
 async function init(){
- if(!roomCode||!token){showLogin();return}
- hide("login");hide("landing");show("room");
+ if(!roomCode||!token){show("landing");hide("room");return}
+ hide("landing");show("room");
+ $("logout-btn").classList.remove("hidden");
+ syncClock(5);
+ let me,snap;
+ for(let attempt=0;;attempt++){
+   try{me=await api(`/api/rooms/${roomCode}/me`);snap=await api(`/api/rooms/${roomCode}/snapshot`);break}
+   catch(e){
+     if(e instanceof AuthError||/not found/i.test(e.message)){endSession("Your session is no longer valid. Please sign in again.");return}
+     setConnection("Reconnecting…","wait");              // offline or server restarting: keep the session, keep trying
+     await new Promise(r=>setTimeout(r,Math.min(1000*(attempt+1),8000)));
+   }
+ }
  try{
-   const me=await api(`/api/rooms/${roomCode}/me`);
-   const snap=await api(`/api/rooms/${roomCode}/snapshot`);
    isHost=me.is_host;
    myFranchise=me.franchise;
-   $("role-label").textContent=roleText();
-   try{localStorage.setItem("smat_last_room",roomCode)}catch(e){}
+   paintRoleLabel();
    if(isHost){
-    if(snap.room.status==="SETUP"){show("host-setup");await loadPool();showStoredCredentials(snap)}
+    if(snap.room.status==="SETUP"){show("host-setup");await loadPool()}
     else {show("live-area");show("admin-controls")}
    }
    else if(myFranchise){show("live-area")}
-   else {show("live-area");$("bid-button").disabled=true;message("You are viewing only. Log in with a team password to bid.")}
+   else {show("live-area");$("bid-button").disabled=true;message("Sign in with your franchise to enable bidding.")}
    await render(snap); connect();
- }catch(e){
-  if(e.status===401||e.status===403||e.status===404){
-   // The credential is genuinely invalid (wrong, reset by the host, or the room is gone).
-   clearSession();roomCode=token=null;
-   showLogin(e.status===404?"That auction no longer exists.":"Your login is no longer valid. Please sign in again.");
-  }else{
-   // Network trouble is NOT a reason to sign anyone out: keep the session and keep trying.
-   $("connection").textContent="Reconnecting…";$("connection").classList.remove("ok");
-   setTimeout(init,2000);
-  }
- }
+ }catch(e){console.error(e);setConnection("Reconnecting…","wait");setTimeout(()=>init(),3000)}
+}
+function endSession(msg){
+ clearSession();token=null;roomCode=null;isHost=false;myFranchise=null;
+ clearTimeout(reconnectTimer);reconnectTimer=null;clearInterval(heartbeatTimer);
+ if(ws){const w=ws;ws=null;w.onclose=null;try{w.close()}catch(e){}}
+ state=null;hasInitialSnapshot=false;
+ hide("room");show("landing");$("logout-btn").classList.add("hidden");$("me-chip").classList.add("hidden");$("role-label").classList.add("hidden");
+ setConnection("Not connected","off");
+ const er=$("login-error");if(msg){er.textContent=msg;er.classList.remove("hidden")}else er.classList.add("hidden");
+}
+$("logout-btn").onclick=()=>{if(confirm("Sign out of this auction on this device?")){endSession("");location.href="/"}};
+function paintRoleLabel(){
+ const el=$("role-label");if(!el)return;
+ el.textContent=isHost?(myFranchise?"Host":"Administrator"):(myFranchise?myFranchise.name:"Guest");
+ el.classList.toggle("hidden",!isHost);   // franchise owners see their team chip instead
 }
 async function render(s){
  // Concurrent bid responses can arrive out of order. Never let an older
  // committed room version overwrite a newer snapshot already rendered.
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
- if(s.server_time)syncServerClock(s.server_time);
- state=s;lastSnapshot=s;bidFieldsVersion=0;
+ state=s;lastSnapshot=s;bidFieldsVersion=0;noteSnapshotTime(s);
+ franchiseOrder=(s.franchises||[]).map(f=>Number(f.id));
+ if(isHost){const key=franchiseOrder.join(",");if(key!==render._accessKey){render._accessKey=key;const fl=(s.franchises||[]).map(f=>({id:f.id,name:f.name}));renderAccess($("invite-list"),fl);renderAccess($("access-live"),fl)}}
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
@@ -102,57 +117,60 @@ async function render(s){
   const newResults=snapshotEvents
    .filter(e=>(Number(e.id)||0)>lastCelebrationEventId && (e.kind==="SOLD"||e.kind==="UNSOLD"))
    .sort((a,b)=>(Number(a.id)||0)-(Number(b.id)||0));
-  if(newResults.length)celebrate(newResults[newResults.length-1]);
+  if(newResults.length&&s.room.status==="BETWEEN_LOTS")celebrate(newResults[newResults.length-1]);
   lastCelebrationEventId=Math.max(lastCelebrationEventId||0,newestEventId);
  }
- $("connection").textContent=ws&&ws.readyState===1?"Connected":"Connecting…";$("connection").classList.toggle("ok",!!(ws&&ws.readyState===1));
+ if(ws&&ws.readyState===1)setConnection("Connected","on");else setConnection("Connecting…","wait");
  const expandedFranchises=new Set([...document.querySelectorAll("#franchises details[open]")].map(el=>String(el.dataset.franchise)));
- $("franchises").innerHTML=s.franchises.map(f=>{
-  const own=myFranchise&&Number(myFranchise.id)===Number(f.id);
+ const others=s.franchises.filter(f=>!(myFranchise&&Number(myFranchise.id)===Number(f.id)));
+ $("franchises").innerHTML=others.map(f=>{
   const squad=f.squad||[];
-  const expanded=own||expandedFranchises.has(String(f.id));
-  return `<details data-franchise="${f.id}" class="franchise ${s.current_player&&s.current_player.highest_franchise_id===f.id?"leading-team":""}" ${expanded?"open":""}>
-   <summary><span class="fr-avatar" style="--hue:${hueFor(f.name)}">${esc(initials(f.name))}</span><div class="fr-text"><strong>${esc(f.name)}${own?" · MY TEAM":""}</strong><div class="meta">Purse: ${money(f.purse_remaining)} · Squad: ${f.squad_count}/${s.room.max_squad} <span class="expand-hint">Click to view squad</span></div></div></summary>
-   <div class="franchise-squad">${squad.length?`<table><thead><tr><th>Player</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map(x=>`<tr><td>${esc(x.player)}</td><td>${esc(x.role||"—")}</td><td>${money(x.price)}</td></tr>`).join("")}</tbody></table>`:`<span class="muted">No players purchased yet.</span>`}</div>
+  const expanded=expandedFranchises.has(String(f.id));
+  const pct=Math.min(100,Math.round(100*(f.squad_count||0)/Math.max(1,s.room.max_squad)));
+  const leads=s.current_player&&s.current_player.highest_franchise_id===f.id;
+  return `<details data-franchise="${f.id}" class="franchise ${leads?"leading-team":""}" ${expanded?"open":""}>
+   <summary>${badgeHTML(f.name,f.id)}<div class="t-name">${esc(f.name)}<span class="chip lead">Leading</span></div><div class="t-purse"><b>${money(f.purse_remaining)}</b><small>Purse</small></div><div class="t-squad"><b>${f.squad_count}/${s.room.max_squad}</b><div class="bar"><i style="width:${pct}%"></i></div></div></summary>
+   <div class="franchise-squad">${squad.length?`<table><thead><tr><th>Player</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map(x=>`<tr><td>${esc(x.player)}</td><td>${esc(roleLabel(x.role))}</td><td>${money(x.price)}</td></tr>`).join("")}</tbody></table>`:`<span class="muted">No players purchased yet.</span>`}</div>
   </details>`;
  }).join("");
- $("activity").innerHTML=s.events.map(e=>`<div class="activity-item kind-${esc(e.kind||"")}">${esc(e.message)}</div>`).join("")||'<p class="muted">No activity yet.</p>';
+ $("franchises-title").classList.toggle("hidden",!(myFranchise&&others.length));
+ $("tab-count-f").textContent=s.franchises.length;
+ paintMyTeam(s);
+ $("activity").innerHTML=s.events.map(activityHTML).join("")||'<p class="muted">No activity yet.</p>';
+ paintMeChip(s);
  if(s.room.status === "COMPLETED"){
   hide("live-area");hide("host-setup");hide("admin-controls");show("final-results");
   renderFinalResults(s);
   clearInterval(timerInterval);
+  syncDock();
   return;
  }
  hide("final-results");
- if(s.current_player){
-  const p=s.current_player;show("live-area");
-  clearTimeout(revealTimer);
-  const lead=leadInSeconds(s,p);
-  if(lead>0.15){
-   // The previous player's result banner is still showing: keep the new player hidden (and unbiddable)
-   // until the server's lead-in ends. The overlay is cut short to end exactly then.
-   setPending(true);
-   const root=$("celebration");clearTimeout(root._hideTimer);root._hideTimer=setTimeout(()=>root.classList.add("hidden"),lead*1000);
-   $("timer").textContent="—";$("timer").classList.remove("urgent");clearInterval(timerInterval);
-   revealTimer=setTimeout(()=>{if(state===s||state?.current_player?.lot_id===p.lot_id){setPending(false);paintBid();startLocalTimer(state.current_player.ends_at)}},lead*1000+30);
-  }else setPending(false);
-  $("player-name").textContent=p.name;$("player-role").textContent=p.role;$("player-team").textContent=p.state_team;
+ const betweenLots=!s.current_player&&s.room.status==="BETWEEN_LOTS";
+ const resultEvent=betweenLots?(s.events||[]).find(e=>e.kind==="SOLD"||e.kind==="UNSOLD"):null;
+ $("queue-label").textContent=(s.queue_remaining||0)+" in queue";
+ if(resultEvent){
+  // SOLD / UNSOLD replaces the bidding area; the server opens the next player only after this has been shown.
+  clearInterval(timerInterval);
+  showResult(resultEvent);
+  updateBidButton();
+ }else if(s.current_player){
+  const p=s.current_player;show("live-area");hideResult();
+  $("player-name").textContent=p.name;paintRole(p.role);$("player-team").textContent=p.state_team||"";
   $("round-label").textContent="ROUND "+p.round_no;$("base-price").textContent=money(p.base_price);$("current-bid").textContent=money(p.current_bid||p.base_price);
   paintBid();
-  if(lead<=0.15)startLocalTimer(p.ends_at);
+  startLocalTimer(p.ends_at,p.remaining_ms);
  }else{
-  setPending(false);
-  $("player-name").textContent=s.room.status==="COMPLETED"?"Auction completed":"Waiting for next player";
-  $("player-team").textContent="Players remaining: "+s.queue_remaining;$("timer").textContent="—";
+  hideResult();
+  $("player-name").textContent=s.room.status==="ROUND_COMPLETE"?"Round complete":"Waiting for next player";
+  paintRole("");$("player-team").textContent="Players remaining: "+s.queue_remaining;$("timer").textContent="—";
+  setTimerState("idle");$("timer-fill").style.width="0%";
+  $("base-price").textContent="—";$("current-bid").textContent="—";paintLeader(null);
+  $("next-bid").textContent="—";
   updateBidButton();
  }
- // Squad information must refresh even between players, immediately after a sale.
- const ownSquad=myFranchise?(s.franchises.find(f=>Number(f.id)===Number(myFranchise.id))?.squad||[]):[];
- const ownTeam=myFranchise?(s.franchises||[]).find(f=>Number(f.id)===Number(myFranchise.id)):null;
- $("my-squad-count").textContent=ownTeam?`${ownTeam.squad_count}/${s.room.max_squad} players`:"HOST VIEW";
- $("my-squad").innerHTML=myFranchise?(ownSquad.length?`<div class="my-squad-list">${ownSquad.map((x,i)=>`<div class="my-squad-player"><span class="squad-index">${String(i+1).padStart(2,"0")}</span><span class="squad-player-name">${esc(x.player)}<small>${esc(x.role||"PLAYER")}</small></span><strong>${money(x.price)}</strong></div>`).join("")}</div>`:`<div class="squad-empty">No players purchased yet.</div>`):"Administrator view — choose a franchise under More host options to bid and see its squad.";
  if(isHost){
-  show("admin-controls");renderUnsold(s.unsold);
+  show("admin-controls");show("host-bar");renderUnsold(s.unsold);
   const status=s.room.status;
   paintHostButtons(s);
   const warning=$("unsold-warning");
@@ -162,7 +180,114 @@ async function render(s){
   const livePicker=$("host-franchise-live");
   if(livePicker){livePicker.innerHTML=hostFranchiseOptions(s);livePicker.value=s.room.host_franchise_id||"";}
  }
+ syncDock();
 }
+// ---- clock sync: every device counts down against the SERVER's clock ---------------------------
+// NTP-style: several round trips to /api/time, keep the lowest-latency sample (offset = server time minus
+// the midpoint of the request), then blend into the running estimate. Repeats while the page is open.
+let clockOffset=0,clockSynced=false;
+const serverNow=()=>Date.now()+clockOffset;
+async function syncClock(samples=5){
+ let best=null;
+ for(let i=0;i<samples;i++){
+  try{
+   const w0=Date.now(),t0=performance.now();
+   const r=await fetch("/api/time",{cache:"no-store"});const d=await r.json();
+   const rtt=performance.now()-t0;
+   if(!best||rtt<best.rtt)best={rtt,offset:d.t-(w0+rtt/2)};
+  }catch(e){break}
+  await new Promise(r=>setTimeout(r,i<samples-1?80:0));
+ }
+ if(!best||best.rtt>2500)return;
+ clockOffset=clockSynced?clockOffset*0.4+best.offset*0.6:best.offset;
+ clockSynced=true;
+ window.__clock={offset:Math.round(clockOffset),rtt:Math.round(best.rtt)};
+}
+function noteSnapshotTime(s){   // rough prior until the first real sync completes
+ if(!clockSynced&&s&&s.server_time){const t=Date.parse(s.server_time);if(t)clockOffset=t-Date.now()}
+}
+setInterval(()=>{if(roomCode&&!document.hidden)syncClock(3)},15000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&roomCode)syncClock(4)});
+window.addEventListener("online",()=>{if(roomCode)syncClock(4)});
+
+// ---- bid box: who is leading, right next to the price ---------------------------------------------
+function paintLeader(p){
+ const box=$("leading"),b=$("leader-badge"),name=$("leader-name"),lab=$("leader-label"),you=$("leader-you");
+ if(!p||!p.highest_franchise){
+  box.className="leading";b.innerHTML="";name.textContent="No bids yet";lab.textContent="Opening bid";you.classList.add("hidden");return;
+ }
+ const mine=!!(myFranchise&&Number(p.highest_franchise_id)===Number(myFranchise.id));
+ box.className="leading has-leader"+(mine?" is-me":"");
+ b.innerHTML=badgeHTML(p.highest_franchise,p.highest_franchise_id);
+ name.textContent=p.highest_franchise;lab.textContent="Highest bidder";you.classList.toggle("hidden",!mine);
+}
+
+// ---- your team card (top of the Franchises tab) ----------------------------------------------------
+const ROLE_ORDER=["BAT","BOWL","AR","WK"];
+function paintMyTeam(s){
+ const el=$("my-squad");if(!el)return;
+ const f=myFranchise&&(s.franchises||[]).find(x=>Number(x.id)===Number(myFranchise.id));
+ if(!f){el.innerHTML=isHost?'<p class="muted admin-note">Administrator view. Pick a franchise before the auction starts if you want to bid as well.</p>':"";return}
+ const squad=[...(f.squad||[])].sort((a,b)=>b.price-a.price);
+ const max=Math.max(1,s.room.max_squad),min=s.room.min_squad||0;
+ const pct=Math.min(100,Math.round(100*squad.length/max)),minPct=Math.min(100,Math.round(100*min/max));
+ const counts={};squad.forEach(x=>{const r=String(x.role||"").toUpperCase();counts[r]=(counts[r]||0)+1});
+ const roleChips=ROLE_ORDER.map(r=>`<span class="rc" data-role="${r}"><b>${counts[r]||0}</b>${esc(roleLabel(r).replace("Wicket-Keeper","Keeper"))}</span>`).join("");
+ const need=Math.max(0,min-squad.length);
+ const leads=s.current_player&&Number(s.current_player.highest_franchise_id)===Number(f.id);
+ const spent=squad.reduce((t,x)=>t+Number(x.price||0),0);
+ el.innerHTML=`<div class="team-card${leads?" leading-team":""}">
+  <div class="team-top">${badgeHTML(f.name,f.id)}
+   <div class="team-id"><span class="eyebrow">Your team</span><h3>${esc(f.name)}</h3></div>
+   <span class="chip lead">Leading</span></div>
+  <div class="team-stats">
+   <div><small>Purse left</small><strong>${money(f.purse_remaining)}</strong></div>
+   <div><small>Squad</small><strong>${squad.length}<em>/${max}</em></strong></div>
+   <div><small>Spent</small><strong>${money(spent)}</strong></div></div>
+  <div class="squad-meter" title="Squad size (marker = minimum ${min})"><i style="width:${pct}%"></i><u style="left:${minPct}%"></u></div>
+  <div class="squad-note">${need?`Need ${need} more to reach the minimum of ${min}`:`Minimum squad of ${min} reached`}</div>
+  <div class="role-counts">${roleChips}</div>
+  <div class="team-players">${squad.length?squad.map(x=>`<div class="tp-row"><span class="role-dot" data-role="${esc(String(x.role||"").toUpperCase())}"></span><div class="tp-name"><b>${esc(x.player)}</b><small>${esc(roleLabel(x.role))}${x.state_team?" · "+esc(x.state_team):""}</small></div><strong>${money(x.price)}</strong></div>`).join(""):'<div class="empty-squad">No players yet. Your first buy appears here.</div>'}</div>
+ </div>`;
+}
+
+// ---- Franchises / Activity tabs ---------------------------------------------------------------------
+function selectSideTab(name){
+ document.querySelectorAll(".side-tab").forEach(t=>{const on=t.dataset.side===name;t.classList.toggle("active",on);t.setAttribute("aria-selected",on)});
+ (name==="franchises"?show:hide)("pane-franchises");(name==="activity"?show:hide)("pane-activity");
+ try{localStorage.setItem("smat.sideTab",name)}catch(e){}
+}
+document.querySelectorAll(".side-tab").forEach(t=>t.onclick=()=>selectSideTab(t.dataset.side));
+try{const t=localStorage.getItem("smat.sideTab");if(t==="activity"||t==="franchises")selectSideTab(t)}catch(e){}
+
+function paintRole(r){const el=$("player-role");el.textContent=r?roleLabel(r):"Player";el.dataset.role=String(r||"").toUpperCase()}
+function paintMeChip(s){
+ const el=$("me-chip");if(!el)return;
+ const f=myFranchise&&(s.franchises||[]).find(x=>Number(x.id)===Number(myFranchise.id));
+ if(!f){el.classList.add("hidden");return}
+ el.innerHTML=`${badgeHTML(f.name,f.id)}<span><b>${esc(f.name)}</b><small>Purse ${money(f.purse_remaining)} · ${f.squad_count}/${s.room.max_squad}</small></span>`;
+ el.classList.remove("hidden");
+}
+function setTimerState(st){
+ $("timer-box").dataset.state=st;
+ const u=$("timer-box").querySelector(".unit");if(u)u.textContent=st==="paused"?"PAUSED":"SEC";
+ $("player-panel").dataset.urgent=st==="urgent"?"1":"0";
+}
+// SOLD / UNSOLD stage (inside the player card). Driven by room state, so every device shows it for
+// exactly as long as the server holds the next player back.
+function showResult(e){
+ const sold=e.kind==="SOLD",data=e.data||{};
+ const player=data.player_name||(e.message||"").split(sold?" sold to ":" went unsold")[0]||"Player";
+ const stage=$("result-stage");
+ stage.classList.toggle("unsold",!sold);
+ $("result-tag").textContent=sold?"SOLD":"UNSOLD";
+ $("result-player").textContent=player;
+ $("result-price").textContent=sold?money(data.price):"No bids received";
+ $("result-buyer").innerHTML=sold&&data.franchise_name?`${badgeHTML(data.franchise_name,data.franchise_id)}<span>${esc(data.franchise_name)}</span>`:"";
+ hide("bid-stage");show("result-stage");
+ setTimerState("idle");$("timer-fill").style.width="0%";
+}
+function hideResult(){hide("result-stage");show("bid-stage");$("result-confetti").innerHTML=""}
 function paintHostButtons(s){
  const status=s.room.status, history=s.history||{};
  const controls={pause:status!=="LIVE",resume:status!=="PAUSED",
@@ -170,6 +295,8 @@ function paintHostButtons(s){
   "undo-sale":!history.can_undo_sale,"redo-sale":!history.can_redo_sale,
   finish:status==="COMPLETED"};
  document.querySelectorAll("[data-action]").forEach(b=>b.disabled=!!controls[b.dataset.action]);
+ const pill=$("room-status");
+ if(pill){pill.dataset.status=status;pill.textContent=({LIVE:"Live",PAUSED:"Paused",BETWEEN_LOTS:"Between players",ROUND_COMPLETE:"Round complete",COMPLETED:"Completed",SETUP:"Setup"})[status]||status}
 }
 function hostFranchiseOptions(s){
  return `<option value="">Host only — not bidding</option>`+(s.franchises||[]).map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("");
@@ -201,30 +328,20 @@ function renderFinalResults(s){
 
 function celebrate(event){
   const sold=event.kind==="SOLD";
-  const data=event.data||{};
-  const player=(event.message||"").split(sold?" sold to ":" went unsold")[0]||"Player";
-  const price=data.price;
-  $("celebration-title").textContent=sold?"PLAYER SOLD!":"PLAYER UNSOLD";
-  $("celebration-detail").textContent=sold?`${player} sold for ${money(price)}${data.franchise_name?" to "+data.franchise_name:""}`:`${player} went unsold`;
-  const root=$("celebration"), layer=$("confetti-layer");
+  const layer=$("result-confetti");
   layer.innerHTML="";
-  // Both outcomes get a visual particle effect: bright celebratory confetti
-  // for sales, and slower muted paper for unsold players.
-  const particleCount=sold?90:34;
+  // Bright confetti for a sale, slow muted paper for an unsold player.
+  const particleCount=sold?90:30;
   for(let i=0;i<particleCount;i++){
     const piece=document.createElement("span");
-    piece.className=sold?"confetti-piece":"confetti-piece unsold-confetti-piece";
+    piece.className="confetti-piece";
     piece.style.left=(Math.random()*100)+"%";
     piece.style.animationDelay=(Math.random()*(sold?0.8:0.35))+"s";
     piece.style.animationDuration=(sold?2.2+Math.random()*1.8:2.8+Math.random()*1.8)+"s";
     piece.style.setProperty("--drift",(Math.random()*(sold?240:120)-(sold?120:60))+"px");
     layer.appendChild(piece);
   }
-  root.classList.remove("hidden");
-  root.classList.toggle("unsold-celebration",!sold);
   playCelebrationSound(sold);
-  clearTimeout(root._hideTimer);
-  root._hideTimer=setTimeout(()=>root.classList.add("hidden"),sold?4800:3600);
 }
 function prepareCelebrationAudio(){
   try{
@@ -254,31 +371,23 @@ function playCelebrationSound(sold){
     });
   }catch(e){/* Audio is optional; visual celebration still works. */}
 }
-let revealTimer=null, pendingReveal=false;
-function leadInSeconds(s,p){
- if(!p||!p.ends_at||s.room.status!=="LIVE")return 0;
- const iso=/([zZ]|[+-]\d{2}:?\d{2})$/.test(p.ends_at)?p.ends_at:p.ends_at+"Z";
- return (new Date(iso).getTime()-Date.now())/1000-(Number(s.room.timer_seconds)||10);
-}
-function setPending(on){
- pendingReveal=on;
- $("intermission").classList.toggle("hidden",!on);$("player-main").classList.toggle("hidden",on);
- document.querySelector(".player-panel").classList.toggle("pending",on);
- updateBidButton();
-}
-function initials(name){const w=String(name||"").trim().split(/\s+/).filter(Boolean);return (w.length>1?w[0][0]+w[1][0]:String(name||"?").slice(0,2)).toUpperCase()}
-function hueFor(name){let h=0;for(const c of String(name||""))h=(h*31+c.charCodeAt(0))%360;return h}
-function paintTimer(sec){
- const t=$("timer"),fill=$("timer-fill"),total=Number(state?.room?.timer_seconds)||10;
- t.textContent=sec.toFixed(1)+"s";t.classList.toggle("urgent",sec>0&&sec<=3);
- if(fill)fill.style.width=Math.max(0,Math.min(100,sec/total*100))+"%";
-}
-function startLocalTimer(endsAt){
+function startLocalTimer(endsAt,remainingMs){
  clearInterval(timerInterval);
- if(!endsAt){$("timer").textContent="PAUSED";$("timer").classList.remove("urgent");return}
+ if(!endsAt){
+  // Paused: show the time that will be on the clock when bidding resumes.
+  const total=Math.max(1,Number(state?.room?.timer_seconds)||10),sec=Math.max(0,(Number(remainingMs)||0)/1000);
+  $("timer").textContent=remainingMs!=null?sec.toFixed(1):"PAUSED";
+  $("timer-fill").style.width=Math.min(100,100*sec/total)+"%";
+  setTimerState("paused");return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const update=()=>paintTimer(Math.max(0,(deadline-(Date.now()+serverClockOffsetMs))/1000));
+ const total=Math.max(1,Number(state?.room?.timer_seconds)||10);
+ const update=()=>{
+  const sec=Math.max(0,(deadline-serverNow())/1000);
+  $("timer").textContent=sec.toFixed(1);
+  $("timer-fill").style.width=Math.min(100,100*sec/total)+"%";
+  setTimerState(sec<=3?"urgent":"live");
+ };
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
@@ -301,7 +410,6 @@ function patchBidFields(p,e){
 // is still missing after GAP_WAIT_MS triggers the (expensive) full-snapshot recovery.
 const GAP_WAIT_MS=1500, pendingEvents=new Map();let gapTimer=null;
 function applyBidEvent(e){
- if(e.server_time)syncServerClock(e.server_time);
  const v=Number(e.room_version), have=roomVersion();
  if(!state||!state.current_player){requestResync("no-state");return}
  if(v<=have)return;                                   // duplicate or older than what we already show
@@ -363,27 +471,36 @@ async function requestResync(reason,attempt=0){
 function paintBid(){
  const p=state?.current_player;if(!p)return;
  $("current-bid").textContent=money(p.current_bid||p.base_price);
- $("leading").textContent=p.highest_franchise?"Leading: "+p.highest_franchise:"No bids yet";
- const bidder=$("current-bidder-name");if(bidder)bidder.textContent=p.highest_franchise||"No bidder yet";
- const bidderBox=$("current-bidder");if(bidderBox)bidderBox.classList.toggle("has-bidder",!!p.highest_franchise);
+ paintLeader(p);
  $("next-bid").textContent=money(p.next_bid);
  // Highlight the leader without rebuilding the franchise cards (keeps expanded squads open).
  document.querySelectorAll("#franchises details[data-franchise]").forEach(el=>
   el.classList.toggle("leading-team",Number(el.dataset.franchise)===Number(p.highest_franchise_id)));
+ const mt=$("my-squad").querySelector(".team-card");if(mt)mt.classList.toggle("leading-team",!!(myFranchise&&Number(p.highest_franchise_id)===Number(myFranchise.id)));
  updateBidButton();
 }
 function updateBidButton(){
  const b=$("bid-button"),p=state?.current_player;
- if(isHost&&!myFranchise){hide("bid-button");return}
+ const bidder=!(isHost&&!myFranchise);
+ $("bid-dock").classList.toggle("hidden",!bidder);
+ if(!bidder){hide("bid-button");syncDock();return}
  show("bid-button");
  const leading=!!(p&&myFranchise&&Number(p.highest_franchise_id)===Number(myFranchise.id));
- b.disabled=!myFranchise||!p||state?.room?.status!=="LIVE"||bidInFlight||leading||pendingReveal;
+ const live=!!p&&state?.room?.status==="LIVE";
+ b.disabled=!myFranchise||!p||!live||bidInFlight||leading;
+ const label=$("bid-label");
+ if(label)label.textContent=bidInFlight?"Sending…":leading?"You lead":!myFranchise?"Sign in to bid":live?"Place bid":(state?.room?.status==="PAUSED"?"Paused":"Bidding closed");
+ syncDock();
+}
+// On phones the bid button is pinned to the bottom edge; reserve space for it only when it is shown.
+function syncDock(){
+ const dock=$("bid-dock");
+ document.body.classList.toggle("has-dock",!!dock&&!dock.classList.contains("hidden")&&!$("live-area").classList.contains("hidden"));
 }
 function prependActivity(e){
  const box=$("activity");if(!box)return;
  const placeholder=box.querySelector("p.muted");if(placeholder)placeholder.remove();
- const div=document.createElement("div");div.className="activity-item kind-"+String(e.kind||"").replace(/[^A-Z_]/g,"");div.textContent=e.message;
- box.prepend(div);
+ box.insertAdjacentHTML("afterbegin",activityHTML(e));
  while(box.children.length>30)box.lastElementChild.remove();
 }
 function connect(){
@@ -393,15 +510,16 @@ function connect(){
  const socket=new WebSocket(`${proto}://${location.host}/ws/${roomCode}?token=${encodeURIComponent(token)}`);
  ws=socket;
  socket.onopen=()=>{
-  reconnectDelay=1000;$("connection").textContent="Connected";$("connection").classList.add("ok");
+  reconnectDelay=1000;setConnection("Connected","on");syncClock(3);
   clearInterval(heartbeatTimer);
   heartbeatTimer=setInterval(()=>{if(socket.readyState===WebSocket.OPEN)socket.send("ping")},25000);
  };
  socket.onclose=()=>{
   clearInterval(heartbeatTimer);
   if(ws===socket)ws=null;
-  $("connection").textContent="Reconnecting…";$("connection").classList.remove("ok");
-  if(!reconnectTimer){
+  setConnection("Reconnecting…","wait");
+  if(token&&roomCode)api(`/api/rooms/${roomCode}/me`).catch(e=>{if(e instanceof AuthError)endSession("Your password was reset. Please sign in again.")});
+  if(!reconnectTimer&&token){
    const delay=reconnectDelay;reconnectDelay=Math.min(reconnectDelay*2,15000);
    reconnectTimer=setTimeout(()=>{reconnectTimer=null;connect()},delay);
   }
@@ -412,6 +530,10 @@ function connect(){
  };
 }
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+document.querySelectorAll(".tab[data-tab]").forEach(t=>t.onclick=()=>{
+ document.querySelectorAll(".tab[data-tab]").forEach(x=>{x.classList.toggle("active",x===t);x.setAttribute("aria-selected",x===t)});
+ (t.dataset.tab==="join"?show:hide)("login-form");(t.dataset.tab==="create"?show:hide)("create-form");
+});
 $("create-form").addEventListener("submit",async e=>{
  e.preventDefault();const fd=new FormData(e.target);
  const franchises=fd.get("franchises").split("\n").map(x=>x.trim()).filter(Boolean);
@@ -420,72 +542,10 @@ $("create-form").addEventListener("submit",async e=>{
    name:fd.get("name"),franchises,purse:Number(fd.get("purse")),timer_seconds:Number(fd.get("timer_seconds")),
    min_squad:Number(fd.get("min_squad")),max_squad:Number(fd.get("max_squad")),bid_extension:fd.get("bid_extension")==="on"
   })}).then(async r=>{const x=await r.json();if(!r.ok)throw Error(x.detail);return x});
-  saveCreds(d);
-  $("invite-output").innerHTML=credentialsHtml(d.room_code,{host:d.host_password,teams:Object.fromEntries(d.franchise_invites.map(x=>[x.franchise_id,x.password]))},d.franchise_invites.map(x=>({id:x.franchise_id,name:x.franchise})),true);
-  wireCredentials($("invite-output"));show("invite-output");hide("landing");
-  roomCode=d.room_code;token=d.host_token;isHost=true;saveSession({room:roomCode,token});await init();
+  roomCode=d.room_code;token=d.host_token;isHost=true;saveSession();
+  showCredentials(d);hide("landing");await init();
  }catch(err){alert(err.message)}
 });
-// ---- team logins (shown to the host) ----------------------------------------------------------
-function saveCreds(d){try{localStorage.setItem("smat_creds_"+d.room_code,JSON.stringify({host:d.host_password,teams:Object.fromEntries(d.franchise_invites.map(x=>[x.franchise_id,x.password]))}))}catch(e){}}
-function loadCreds(code){try{return JSON.parse(localStorage.getItem("smat_creds_"+code))||{teams:{}}}catch(e){return {teams:{}}}}
-function loginMessage(code,team,pw){return `SMAT Auction\nRoom code: ${code}\nTeam: ${team}\nPassword: ${pw}\nOpen ${location.origin} and tap "Join auction".`}
-function credentialsHtml(code,c,teams,fresh){
- const rows=teams.map(t=>{const pw=(c.teams||{})[t.id];return `<tr><td>${esc(t.name)}</td><td class="pw">${pw?esc(pw):'<span class="muted">not stored on this device</span>'}</td><td class="cred-actions">${pw?`<button type="button" class="secondary" data-copy="${esc(loginMessage(code,t.name,pw))}">Copy message</button>`:""}<button type="button" class="secondary" data-reset="${t.id}">New password</button></td></tr>`}).join("");
- const host=c.host?`<tr><td>Host</td><td class="pw">${esc(c.host)}</td><td class="cred-actions"><button type="button" class="secondary" data-copy="${esc(loginMessage(code,"Host (administrator)",c.host))}">Copy message</button></td></tr>`:"";
- return `<div class="section-head"><h2>${fresh?"Auction created":"Team logins"}</h2><span class="muted">Room code <b class="roomcode">${esc(code)}</b></span></div>
-  <p class="muted">${fresh?"Send each franchise its message below. ":""}Passwords are stored only on this device; the server keeps just a scrambled copy. “New password” replaces a lost one.</p>
-  <div class="table-wrap"><table><thead><tr><th>Team</th><th>Password</th><th></th></tr></thead><tbody>${rows}${host}</tbody></table></div>
-  <div class="button-row" style="margin-top:12px"><button type="button" class="primary" data-copy-all="1">Copy all messages</button></div>`;
-}
-function wireCredentials(box){
- const code=roomCode;
- box.onclick=async(ev)=>{
-  const t=ev.target.closest("button");if(!t)return;
-  if(t.dataset.copy!==undefined){await copyText(t.dataset.copy);t.textContent="Copied ✓";setTimeout(()=>t.textContent="Copy message",1500)}
-  else if(t.dataset.copyAll){const c=loadCreds(code),names=(state?.franchises||[]);
-   await copyText(names.filter(f=>c.teams[f.id]).map(f=>loginMessage(code,f.name,c.teams[f.id])).join("\n\n"));t.textContent="Copied ✓";setTimeout(()=>t.textContent="Copy all messages",1500)}
-  else if(t.dataset.reset){
-   if(!confirm("Create a new password for this team? The old one stops working."))return;
-   try{const d=await api(`/api/rooms/${code}/host/reset-password`,{method:"POST",body:JSON.stringify({franchise_id:Number(t.dataset.reset)})});
-    const c=loadCreds(code);c.teams=c.teams||{};c.teams[d.franchise_id]=d.password;try{localStorage.setItem("smat_creds_"+code,JSON.stringify(c))}catch(e){}
-    renderCredsBox()}catch(e){alert(e.message)}
-  }
- };
-}
-async function copyText(s){try{await navigator.clipboard.writeText(s)}catch(e){const ta=document.createElement("textarea");ta.value=s;document.body.appendChild(ta);ta.select();try{document.execCommand("copy")}catch(_){}ta.remove()}}
-function showStoredCredentials(snap){
- // Setup phase: put the team logins at the top so the host can send them out before starting.
- const c=loadCreds(roomCode);if(!c.host&&!Object.keys(c.teams||{}).length)return;
- $("invite-output").innerHTML=credentialsHtml(roomCode,c,(snap.franchises||[]).map(f=>({id:f.id,name:f.name})),false);
- wireCredentials($("invite-output"));show("invite-output");
-}
-function renderCredsBox(){
- const box=$("creds-box");if(!box||!state)return;
- box.innerHTML=credentialsHtml(roomCode,loadCreds(roomCode),(state.franchises||[]).map(f=>({id:f.id,name:f.name})),false);wireCredentials(box);
-}
-$("show-creds").onclick=()=>{const box=$("creds-box");if(box.classList.contains("hidden")){renderCredsBox();box.classList.remove("hidden")}else box.classList.add("hidden")};
-// ---- login form / log out -------------------------------------------------------------------------
-$("login-room").addEventListener("input",()=>{clearTimeout($("login-room")._t);$("login-room")._t=setTimeout(loadTeams,250)});
-$("login-room").addEventListener("blur",loadTeams);
-$("login-show").onchange=e=>{$("login-password").type=e.target.checked?"text":"password"};
-$("show-create").onclick=()=>{hide("login");show("landing")};
-$("show-login").onclick=()=>{hide("landing");showLogin()};
-$("login-form").addEventListener("submit",async e=>{
- e.preventDefault();const err=$("login-error"),btn=$("login-submit");
- const code=$("login-room").value.trim().toUpperCase(),team=$("login-team").value,pw=$("login-password").value;
- if(!team){err.textContent="Choose your team.";err.classList.remove("hidden");return}
- btn.disabled=true;btn.textContent="Signing in…";err.classList.add("hidden");
- try{
-  const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({room_code:code,team,password:pw})});
-  const d=await r.json().catch(()=>({}));
-  if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Could not sign in");
-  saveSession({room:d.room_code,token:d.token});
-  roomCode=d.room_code;token=d.token;
-  location.reload();            // start from a clean page state for the new identity
- }catch(ex){err.textContent=ex instanceof TypeError?"Could not reach the server. Check your connection and try again.":ex.message;err.classList.remove("hidden");btn.disabled=false;btn.textContent="Join auction"}
-});
-$("logout").onclick=()=>{if(!confirm("Log out? You will need your team password to get back in."))return;clearSession();location.reload()};
 // The amount sent is the price that was on the button when the user pressed it (pointerdown),
 // so a price that changes under their finger is rejected as stale instead of being bid blindly.
 $("bid-button").addEventListener("pointerdown",()=>{
@@ -511,6 +571,7 @@ $("bid-button").onclick=async()=>{
   if(r.ok){applyIncoming(d);message(`Bid accepted: ${money(d.highest_bid)} · ${ms} ms`)}
   else{
    if(d.state)applyRejectionState(d.state);
+   if(r.status===401){endSession("Your password was reset. Please sign in again.");return}
    message(rejectionText(d)+` [${r.status} ${d.code||"error"}${d.request_id?" "+d.request_id:""}]`);
    // The outcome of a failed request may be unknown (e.g. 503): confirm against the server.
    if(r.status>=500)requestResync("bid-error");
@@ -530,11 +591,10 @@ function rejectionText(d){
   case "INSUFFICIENT_PURSE":return d.detail||"Insufficient purse for this bid.";
   case "PLAYER_ALREADY_SETTLED":return "That player has already been settled.";
   case "TIMER_EXPIRED":return "Time is up for this player.";
-  case "PLAYER_NOT_STARTED":return "The next player is about to start — bidding opens in a moment.";
   default:return d.detail||"Bid rejected";
  }
 }
-$("start-auction").onclick=async()=>{if(!confirm("Lock the player pool and start the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/start`,{method:"POST"});render(d);show("live-area");hide("host-setup");hide("invite-output");}catch(e){alert(e.message)}};
+$("start-auction").onclick=async()=>{if(!confirm("Lock the player pool and start the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/start`,{method:"POST"});render(d);show("live-area");hide("host-setup");}catch(e){alert(e.message)}};
 document.querySelectorAll("[data-action]").forEach(b=>b.onclick=async()=>{const action=b.dataset.action;if(action==="finish"&&!confirm("End the auction?"))return;try{const d=await api(`/api/rooms/${roomCode}/host/${action}`,{method:"POST"});render(d)}catch(e){alert(e.message)}});
 async function loadPool(){pool=await api(`/api/rooms/${roomCode}/pool`);renderPool()}
 function renderPool(){
@@ -551,7 +611,7 @@ async function updateHostFranchise(value){
   const d=await api(`/api/rooms/${roomCode}/host/select-franchise`,{method:"POST",body:JSON.stringify({franchise_id:value?Number(value):null})});
   const selected=(d.franchises||[]).find(f=>Number(f.id)===Number(value));
   myFranchise=selected?{id:selected.id,name:selected.name}:null;
-  $("role-label").textContent=roleText();
+  $("role-label").textContent=myFranchise?` · Host / ${myFranchise.name}`:" · Administrator";
   render(d);
  }catch(e){alert(e.message);render(state)}
 }
@@ -570,8 +630,55 @@ $("nominate").onclick=async()=>{
 };
 init();
 
-// Switch the compact lower information area without scrolling between panels.
-document.querySelectorAll(".auction-tab").forEach(btn=>btn.addEventListener("click",()=>{
- document.querySelectorAll(".auction-tab").forEach(b=>{const active=b===btn;b.classList.toggle("active",active);b.setAttribute("aria-selected",String(active))});
- document.querySelectorAll(".tab-panel").forEach(panel=>{const active=panel.id===`tab-${btn.dataset.tab}`;panel.hidden=!active;panel.classList.toggle("active",active)});
-}));
+// ---- credentials card, login form, password resets ---------------------------------------------
+function inviteText(code,name,pw){return `Join the ${state?.room?.name||"SMAT"} auction\n${location.origin}\nRoom code: ${code}\nFranchise: ${name}\nPassword: ${pw}`}
+async function copyText(t,btn){
+ try{await navigator.clipboard.writeText(t)}catch(e){const a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();try{document.execCommand("copy")}catch(_){}a.remove()}
+ if(btn){const o=btn.textContent;btn.textContent="Copied";setTimeout(()=>btn.textContent=o,1400)}
+}
+function showCredentials(d){
+ const rows=[{franchise:d.host_login.franchise,password:d.host_login.password,host:true},...d.credentials];
+ const box=$("invite-output");
+ box.innerHTML=`<div class="section-head"><div><h2>Auction created</h2><p class="muted">Send each person their franchise name, password and the room code. Passwords are shown <b>only now</b>; you can issue a new one any time from Access.</p></div>
+  <button class="secondary" id="cred-copy-all" type="button">Copy all</button></div>
+  <div class="room-code-card"><span class="lbl">Room code</span><strong>${esc(d.room_code)}</strong><span class="muted">${esc(location.origin)}</span></div>
+  <div class="cred-list">${rows.map((r,i)=>`<div class="cred-row${r.host?" host":""}"><div class="cred-name">${r.host?'<span class="host-tag">HOST</span>':badgeHTML(r.franchise,i)}<b>${esc(r.franchise)}</b></div><code class="cred-pw">${esc(r.password)}</code><button class="ghost small" type="button" data-copy="${i}">Copy invite</button></div>`).join("")}</div>
+  <button class="ghost small" id="cred-dismiss" type="button">I have saved these</button>`;
+ box.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>{const r=rows[+b.dataset.copy];copyText(inviteText(d.room_code,r.franchise,r.password),b)});
+ $("cred-copy-all").onclick=e=>copyText(rows.map(r=>inviteText(d.room_code,r.franchise,r.password)).join("\n\n"),e.target);
+ $("cred-dismiss").onclick=()=>hide("invite-output");
+ show("invite-output");
+}
+let namesTimer=null;
+async function loadFranchiseNames(){
+ const code=$("login-room").value.trim().toUpperCase();const dl=$("login-franchise-list");
+ if(code.length<4){dl.innerHTML="";return}
+ try{const r=await fetch(`/api/rooms/${encodeURIComponent(code)}/franchise-names`);if(!r.ok){dl.innerHTML="";return}
+  const d=await r.json();dl.innerHTML=[...d.franchises,d.host_name].map(n=>`<option value="${esc(n)}">`).join("")}catch(e){}
+}
+$("login-room").addEventListener("input",()=>{clearTimeout(namesTimer);namesTimer=setTimeout(loadFranchiseNames,300)});
+$("login-form").addEventListener("submit",async e=>{
+ e.preventDefault();const er=$("login-error"),btn=$("login-submit");er.classList.add("hidden");btn.disabled=true;
+ try{
+  const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+   room:$("login-room").value,franchise:$("login-franchise").value,password:$("login-password").value})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Could not sign in. Please try again.");
+  roomCode=d.room_code;token=d.token;saveSession();$("login-password").value="";await init();
+ }catch(err){er.textContent=(err instanceof TypeError)?"No connection. Check your internet and try again.":err.message;er.classList.remove("hidden")}
+ finally{btn.disabled=false}
+});
+function renderAccess(el,franchises){
+ if(!el)return;
+ el.innerHTML=`<h3>Access</h3><p class="muted">People sign in with the room code, their franchise name and a password. Lost or leaked one? Issue a new password; it signs that franchise out on every device.</p>
+  <div class="room-code-line"><span class="lbl">Room code</span><b>${esc(roomCode)}</b></div>
+  <div class="cred-list">${franchises.map(f=>`<div class="cred-row" data-fid="${f.id}"><div class="cred-name">${badgeHTML(f.name,f.id)}<b>${esc(f.name)}</b></div><code class="cred-pw muted">••••-••••</code><button class="ghost small" type="button" data-reset="${f.id}">New password</button></div>`).join("")}</div>`;
+ el.querySelectorAll("[data-reset]").forEach(b=>b.onclick=async()=>{
+  const f=franchises.find(x=>x.id==b.dataset.reset);
+  if(!confirm(`Issue a new password for ${f.name}? Anyone signed in as ${f.name} will be signed out.`))return;
+  try{const d=await api(`/api/rooms/${roomCode}/host/reset-password`,{method:"POST",body:JSON.stringify({franchise_id:f.id})});
+   const row=b.closest(".cred-row");row.querySelector(".cred-pw").classList.remove("muted");row.querySelector(".cred-pw").textContent=d.password;
+   b.textContent="Copy invite";b.onclick=()=>copyText(inviteText(roomCode,d.franchise,d.password),b);
+  }catch(err){alert(err.message)}
+ });
+}

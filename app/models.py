@@ -22,6 +22,8 @@ class Room(Base):
     version: Mapped[int] = mapped_column(Integer, default=0)
     current_lot_id: Mapped[int | None] = mapped_column(ForeignKey("lots.id"), nullable=True)
     host_franchise_id: Mapped[int | None] = mapped_column(ForeignKey("franchises.id"), nullable=True)
+    host_password_hash: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    host_nonce: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 class Franchise(Base):
     __tablename__ = "franchises"
@@ -32,6 +34,8 @@ class Franchise(Base):
     invite_hash: Mapped[str] = mapped_column(String(64), unique=True)
     purse_remaining: Mapped[int] = mapped_column(Integer)
     created_order: Mapped[int] = mapped_column(Integer)
+    password_hash: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    login_nonce: Mapped[str | None] = mapped_column(String(64), nullable=True)
     __table_args__ = (UniqueConstraint("room_id", "name"),)
 
 class Player(Base):
