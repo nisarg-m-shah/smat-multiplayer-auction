@@ -284,10 +284,10 @@ function showResult(e){
  $("result-player").textContent=player;
  $("result-price").textContent=sold?money(data.price):"No bids received";
  $("result-buyer").innerHTML=sold&&data.franchise_name?`${badgeHTML(data.franchise_name,data.franchise_id)}<span>${esc(data.franchise_name)}</span>`:"";
- hide("bid-stage");show("result-stage");
+ show("result-stage");document.body.classList.add("has-result");
  setTimerState("idle");$("timer-fill").style.width="0%";
 }
-function hideResult(){hide("result-stage");show("bid-stage");$("result-confetti").innerHTML=""}
+function hideResult(){hide("result-stage");document.body.classList.remove("has-result");$("result-confetti").innerHTML=""}
 function paintHostButtons(s){
  const status=s.room.status, history=s.history||{};
  const controls={pause:status!=="LIVE",resume:status!=="PAUSED",
@@ -329,50 +329,89 @@ function renderFinalResults(s){
  }).join("");
 }
 
+// ---- celebration: cannons from both corners plus a rain of paper, across the whole page ----------------
+const CONFETTI_COLORS=["#fbbf24","#f97316","#fde68a","#34d399","#60a5fa","#f472b6","#ffffff","#a78bfa","#ef4444"];
+function confettiPiece(layer,kind,i){
+ const el=document.createElement("i");
+ const w=kind==="strip"?6+Math.random()*4:10+Math.random()*10,h=kind==="strip"?26+Math.random()*22:kind==="dot"?w:14+Math.random()*16;
+ el.className="cf cf-"+kind;
+ el.style.cssText=`width:${w}px;height:${h}px;background:${CONFETTI_COLORS[i%CONFETTI_COLORS.length]}`;
+ layer.appendChild(el);return el;
+}
 function celebrate(event){
-  const sold=event.kind==="SOLD";
-  const layer=$("result-confetti");
-  layer.innerHTML="";
-  // Bright confetti for a sale, slow muted paper for an unsold player.
-  const particleCount=sold?90:30;
-  for(let i=0;i<particleCount;i++){
-    const piece=document.createElement("span");
-    piece.className="confetti-piece";
-    piece.style.left=(Math.random()*100)+"%";
-    piece.style.animationDelay=(Math.random()*(sold?0.8:0.35))+"s";
-    piece.style.animationDuration=(sold?2.2+Math.random()*1.8:2.8+Math.random()*1.8)+"s";
-    piece.style.setProperty("--drift",(Math.random()*(sold?240:120)-(sold?120:60))+"px");
-    layer.appendChild(piece);
+ const sold=event.kind==="SOLD",layer=$("result-confetti");layer.innerHTML="";
+ const reduce=window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches;
+ const W=window.innerWidth,H=window.innerHeight,kinds=["rect","rect","strip","dot"];
+ const fly=(el,frames,dur,delay)=>{if(el.animate)el.animate(frames,{duration:dur,delay,easing:"linear",fill:"forwards"});};
+ if(sold){
+  const cannon=reduce?24:W<600?46:80;
+  // Two cannons fire up and inwards, then gravity pulls the paper down.
+  for(const side of [0,1]){
+   for(let i=0;i<cannon;i++){
+    const el=confettiPiece(layer,kinds[i%4],i+side*3);
+    const x0=side?W+10:-10,y0=H+10,dir=side?-1:1;
+    const vx=dir*(180+Math.random()*(W*0.7)),vy=-(H*0.55+Math.random()*H*0.75),g=H*1.55+Math.random()*H*0.3;
+    const rot=(Math.random()<.5?-1:1)*(360+Math.random()*900),T=2.6+Math.random()*1.9;
+    const frames=[];for(let k=0;k<=14;k++){const t=k/14*T;frames.push({transform:`translate3d(${x0+vx*t*0.62}px,${y0+vy*t+0.5*g*t*t}px,0) rotate(${rot*k/14}deg) scale(${1-0.15*k/14})`,opacity:k>12?0:1})}
+    fly(el,frames,T*1000,Math.random()*450+side*120);
+   }
   }
-  playCelebrationSound(sold);
+  // A shower from the top after the cannons.
+  const rain=reduce?18:W<600?50:110;
+  for(let i=0;i<rain;i++){
+   const el=confettiPiece(layer,kinds[i%4],i),x=Math.random()*W,sway=(Math.random()-.5)*220,T=3+Math.random()*2.2;
+   fly(el,[{transform:`translate3d(${x}px,-40px,0) rotate(0deg)`,opacity:1},{transform:`translate3d(${x+sway}px,${H*.55}px,0) rotate(${300+Math.random()*500}deg)`,opacity:1,offset:.55},{transform:`translate3d(${x-sway/2}px,${H+40}px,0) rotate(${700+Math.random()*700}deg)`,opacity:.9}],T*1000,350+Math.random()*1300);
+  }
+ }else{
+  for(let i=0;i<(reduce?8:26);i++){   // unsold: a few slow grey scraps, no party
+   const el=confettiPiece(layer,"rect",i);el.style.background="#6b7280";el.style.opacity=".6";
+   const x=Math.random()*W,T=3.5+Math.random()*1.5;
+   fly(el,[{transform:`translate3d(${x}px,-30px,0) rotate(0)`},{transform:`translate3d(${x+(Math.random()-.5)*120}px,${H+30}px,0) rotate(${Math.random()*360}deg)`}],T*1000,Math.random()*700);
+  }
+ }
+ playCelebrationSound(sold);
 }
-function prepareCelebrationAudio(){
-  try{
-    const AudioCtx=window.AudioContext||window.webkitAudioContext;
-    if(!AudioCtx)return;
-    audioContext=audioContext||new AudioCtx();
-    if(audioContext.state==="suspended")audioContext.resume();
-  }catch(e){/* Sound may be unavailable in this browser. */}
+
+// ---- sound: bid pings, countdown ticks, an urgent buzzer at zero, and a mute switch --------------------
+let soundOn=true;try{soundOn=localStorage.getItem("smat.sound")!=="off"}catch(e){}
+function paintSoundBtn(){const b=$("sound-btn");if(!b)return;b.classList.toggle("off",!soundOn);b.setAttribute("aria-label",soundOn?"Sound on":"Sound off");b.title=soundOn?"Sound on (tap to mute)":"Sound off (tap to unmute)"}
+paintSoundBtn();
+$("sound-btn").onclick=()=>{soundOn=!soundOn;try{localStorage.setItem("smat.sound",soundOn?"on":"off")}catch(e){}paintSoundBtn();prepareCelebrationAudio();if(soundOn)blip(880,0,.09,"sine",.12)};
+function audioReady(){
+ if(!soundOn||document.hidden)return null;
+ try{
+  const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return null;
+  audioContext=audioContext||new AC();
+  if(audioContext.state==="suspended")audioContext.resume();
+  return audioContext;
+ }catch(e){return null}
 }
-document.addEventListener("pointerdown",prepareCelebrationAudio,{once:true});
+function blip(freq,offset,dur,type,vol,slideTo){
+ const ctx=audioReady();if(!ctx)return;
+ const t=ctx.currentTime+offset,o=ctx.createOscillator(),g=ctx.createGain();
+ o.type=type||"sine";o.frequency.setValueAtTime(freq,t);if(slideTo)o.frequency.exponentialRampToValueAtTime(slideTo,t+dur);
+ g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+0.012);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+ o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+dur+0.03);
+}
+let lastBidPing=0;
+function playBidSound(){            // a bright two-note "ka-ching" for every accepted bid
+ const n=performance.now();if(n-lastBidPing<60)return;lastBidPing=n;
+ blip(988,0,.11,"triangle",.14);blip(1319,.07,.16,"triangle",.13);
+}
+function playTick(secLeft){         // soft click each second; higher and louder as it runs out
+ const f=secLeft<=3?1480:secLeft<=5?1180:940;
+ blip(f,0,.05,"square",secLeft<=3?.07:.045);
+}
+function playTimeUp(){              // urgent double buzzer at zero
+ blip(220,0,.22,"sawtooth",.13,180);blip(220,.26,.34,"sawtooth",.14,150);
+}
+function prepareCelebrationAudio(){audioReady()}
+["pointerdown","keydown","touchstart"].forEach(ev=>document.addEventListener(ev,prepareCelebrationAudio,{passive:true}));
 function playCelebrationSound(sold){
-  try{
-    const AudioCtx=window.AudioContext||window.webkitAudioContext;
-    if(!AudioCtx)return;
-    audioContext=audioContext||new AudioCtx();
-    if(audioContext.state==="suspended")audioContext.resume();
-    const now=audioContext.currentTime;
-    const notes=sold?[523.25,659.25,783.99,1046.5]:[392,329.63,261.63];
-    notes.forEach((freq,i)=>{
-      const osc=audioContext.createOscillator(), gain=audioContext.createGain();
-      osc.type=sold?"triangle":"sine";osc.frequency.value=freq;
-      gain.gain.setValueAtTime(0.0001,now+i*0.14);
-      gain.gain.exponentialRampToValueAtTime(sold?0.13:0.10,now+i*0.14+0.025);
-      gain.gain.exponentialRampToValueAtTime(0.0001,now+i*0.14+0.22);
-      osc.connect(gain);gain.connect(audioContext.destination);
-      osc.start(now+i*0.14);osc.stop(now+i*0.14+0.24);
-    });
-  }catch(e){/* Audio is optional; visual celebration still works. */}
+ // sold: rising fanfare with a sparkle on top; unsold: a soft falling sigh
+ const notes=sold?[523.25,659.25,783.99,1046.5,1318.5]:[392,329.63,261.63];
+ notes.forEach((f,i)=>blip(f,i*(sold?.11:.16),sold?.34:.3,sold?"triangle":"sine",sold?.14:.1));
+ if(sold)[1568,2093,2637].forEach((f,i)=>blip(f,.55+i*.09,.18,"sine",.05));
 }
 function startLocalTimer(endsAt,remainingMs){
  clearInterval(timerInterval);
@@ -385,12 +424,20 @@ function startLocalTimer(endsAt,remainingMs){
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
  const total=Math.max(1,Number(state?.room?.timer_seconds)||10);
+ let lastWhole=null,buzzed=false;
  const update=()=>{
   const sec=Math.max(0,(deadline-serverNow())/1000);
+  const whole=Math.ceil(sec-0.0001);
+  if(whole!==lastWhole){
+   if(lastWhole!==null&&whole>0&&whole<=Math.min(10,total))playTick(whole);   // never on the first paint
+   lastWhole=whole;
+  }
+  if(sec<=0&&!buzzed&&lastWhole===0){buzzed=true;if(!startedAtZero)playTimeUp()}
   $("timer").textContent=sec.toFixed(1);
   $("timer-fill").style.width=Math.min(100,100*sec/total)+"%";
   setTimerState(sec<=3?"urgent":"live");
  };
+ const startedAtZero=(deadline-serverNow())<=0;
  update();timerInterval=setInterval(update,100);
 }
 // ---- real-time sync -------------------------------------------------------------------------
@@ -434,7 +481,7 @@ function applyContiguousBid(e){
  (state.recent_bids=state.recent_bids||[]).push({franchise:e.leading_franchise_name,amount:e.highest_bid,sequence:e.bid_sequence});
  state.history={...(state.history||{}),can_undo_bid:true,can_redo_bid:false};
  if(e.event){state.events=[e.event,...(state.events||[])].slice(0,30);prependActivity(e.event)}
- paintBid();startLocalTimer(p.ends_at);
+ paintBid();startLocalTimer(p.ends_at);playBidSound();
  if(isHost)paintHostButtons(state);
  return true;
 }
@@ -621,7 +668,7 @@ async function updateHostFranchise(value){
 $("host-franchise-setup").onchange=e=>updateHostFranchise(e.target.value);
 $("add-player").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api(`/api/rooms/${roomCode}/players`,{method:"POST",body:JSON.stringify(Object.fromEntries(f))});e.target.reset();await loadPool()}catch(err){alert(err.message)}};
 $("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(d.detail);alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
-function renderUnsold(list){$("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label><input type="checkbox" value="${p.player_id}"> ${esc(p.name)} (${esc(p.role)}) — base ${money(p.base_price)}</label><input class="small-input" type="number" min="1" data-unsold-price="${p.player_id}" placeholder="Keep ${p.base_price}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
+function renderUnsold(list){$("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label><input type="checkbox" value="${p.player_id}"> ${esc(p.name)} <span class="muted">(${esc(roleLabel(p.role))}${p.state_team?" · "+esc(p.state_team):""})</span> — base ${money(p.base_price)}</label><input class="small-input" type="number" min="1" data-unsold-price="${p.player_id}" placeholder="Keep ${p.base_price}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
 $("nominate").onclick=async()=>{
  const ids=[...$("unsold-list").querySelectorAll('input[type="checkbox"]:checked')].map(x=>Number(x.value));
  const price_overrides={};$("unsold-list").querySelectorAll("[data-unsold-price]").forEach(x=>{if(x.value.trim()!=="")price_overrides[x.dataset.unsoldPrice]=Number(x.value)});

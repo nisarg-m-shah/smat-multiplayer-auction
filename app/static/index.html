@@ -27,6 +27,7 @@
       <div id="me-chip" class="me-chip hidden"></div>
       <span id="role-label" class="role-pill hidden"></span>
       <div id="connection" class="conn" data-state="off"><i class="dot"></i><span id="connection-text">Not connected</span></div>
+      <button id="sound-btn" class="ghost small icon-btn" type="button" aria-label="Sound on" title="Sound on/off"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path class="waves" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path class="slash" d="M3 3l18 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
       <button id="logout-btn" class="ghost small hidden" type="button">Sign out</button>
     </div>
   </header>
@@ -149,17 +150,6 @@
               <p id="bid-feedback" class="feedback"></p>
             </div>
 
-            <!-- sold / unsold: replaces the bidding area until the next player opens -->
-            <div id="result-stage" class="result-stage hidden" aria-live="polite">
-              <div id="result-confetti" class="confetti-layer" aria-hidden="true"></div>
-              <div class="result-inner">
-                <div id="result-tag" class="result-tag">SOLD</div>
-                <h3 id="result-player"></h3>
-                <div id="result-price" class="result-price"></div>
-                <div id="result-buyer" class="result-buyer"></div>
-                <div class="result-next"><i class="dot"></i>Next player coming up…</div>
-              </div>
-            </div>
           </div>
 
           <div class="panel side-panel" id="side-panel">
@@ -188,6 +178,17 @@
     </section>
   </main>
   <footer>Private room · Server-controlled bidding · No real-money transactions</footer>
+</div>
+<!-- SOLD / UNSOLD: full-page announcement, shown for exactly as long as the server holds the next player back -->
+<div id="result-stage" class="result-stage hidden" aria-live="polite">
+  <div id="result-confetti" class="confetti-layer" aria-hidden="true"></div>
+  <div class="result-inner">
+    <div id="result-tag" class="result-tag">SOLD</div>
+    <h3 id="result-player"></h3>
+    <div id="result-price" class="result-price"></div>
+    <div id="result-buyer" class="result-buyer"></div>
+    <div class="result-next"><i class="dot"></i>Next player coming up…</div>
+  </div>
 </div>
 <script src="/static/app.js"></script>
 </body>

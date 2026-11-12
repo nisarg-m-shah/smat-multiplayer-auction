@@ -111,3 +111,11 @@ def test_snapshot_enables_bid_history_buttons_while_paused(client):
     assert h["can_undo_bid"]
     a.host("undo-bid")
     assert a.snap()["history"]["can_redo_bid"]
+
+
+def test_unsold_list_includes_state_team(client):
+    a = make_auction(client, players=3, base=100)
+    a.set_deadline(-1)
+    main._settle_expired_lot(a.code)          # nobody bid: unsold
+    u = a.snap()["unsold"]
+    assert u and "state_team" in u[0]

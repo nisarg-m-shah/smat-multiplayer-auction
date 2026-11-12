@@ -824,7 +824,8 @@ def snapshot(db: Session, room: Room):
         "queue_remaining": sum(1 for l in lots if l.status == "QUEUED"),
         "unsold": [{
             "player_id": l.player_id, "name": players[l.player_id].name,
-            "role": players[l.player_id].role, "base_price": l.base_price
+            "role": players[l.player_id].role, "state_team": players[l.player_id].state_team,
+            "base_price": l.base_price
         } for l in current_unsold],
         "events": [{"id": e.id, "kind": e.kind, "message": e.message,
                     "data": e.data or {}, "created_at": e.created_at.isoformat()} for e in events],

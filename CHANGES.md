@@ -79,3 +79,8 @@ Server side was healthy: accepted bids `total_ms` ≈ 365–393 ms, `db_stmts=3`
 - **Home page** copy shortened; developer-only note about `Auction.py` removed from the UI.
 - **Franchise dropdown** on the join form (filled in from the room code). If the host plays as a franchise, that franchise *is* the host login: one entry "Name (Host)", signed in with the host password; no separate "Host" option and no separate franchise password to hand out. The credentials card and Access panel update accordingly.
 - **Host bar** is a single row of buttons; status pill sits at the left and a "More" button opens a drawer (My franchise, Unsold-only round, Access & passwords), each section expandable.
+
+## Update: full-page result, sounds, unsold list
+- **SOLD / UNSOLD** now covers the whole page (dimmed, blurred) for the server's hold time, with a real celebration on SOLD: two confetti cannons from the bottom corners plus a shower of paper (rects, strips, dots; fewer pieces on phones and with reduced-motion). UNSOLD gets a few slow grey scraps. The host bar stays on top and clickable, so Undo is still one tap away.
+- **Sound**: a two-note ping on every accepted bid, a soft tick each second over the last 10 seconds (higher and louder in the last 3), an urgent double buzzer at 0, plus the SOLD fanfare / UNSOLD sigh. A speaker button in the top bar mutes everything and is remembered per device. Browsers only allow audio after a first tap, which happens naturally at sign-in.
+- **Unsold-only round** list now shows each player's role and state team.
