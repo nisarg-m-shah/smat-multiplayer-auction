@@ -8,19 +8,20 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, inspect, text, and_
 from sqlalchemy.orm import Session
 from . import perf, config
-from .db import Base, engine, SessionLocal, get_db
+from .db import Base, engine, SessionLocal, get_db, ensure_columns
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .security import (new_token, token_hash, new_nonce, derive_token, new_password,
                        hash_password, check_password, derive_password)
 from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD, MIN_SQUAD
 from .seed import load_players, load_players_csv
-from .engine import (set_out, pool_view, close_if_everyone_out, get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
+from .engine import (set_out, pool_view, queue_player, close_if_everyone_out, get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
                      undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc,
                      recover_interrupted_rooms, lock_for,
                      BidRejected, AuthError, load_bid_context, validate_bid, apply_bid, compact_state, iso_utc)
 
 Base.metadata.create_all(bind=engine)
+ensure_columns()
 # Lightweight additive migration for rooms created before redo support.
 with engine.begin() as conn:
     inspector = inspect(conn)
@@ -613,7 +614,7 @@ def host_credentials(code: str, authorization: str | None = Header(default=None)
             "franchises": [{"id": f.id, "name": f.name,
                             "password": recover("franchise", f.login_nonce, f.password_hash)} for f in franchises]}
 
-@app.get("/api/rooms/{code}/pool")
+@app.get("/api/rooms/{code}/auction-pool")
 def pool(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
     room, _f, _h = auth_context(db, code, authorization)
     return pool_view(db, room)
@@ -942,6 +943,29 @@ async def host_action(code: str, action: str, authorization: str | None = Header
         task = timer_tasks.get(code.upper())
         if task:
             task.cancel()
+    return result
+
+class QueuePlayerRequest(BaseModel):
+    player_id: int | None = None
+    new: dict | None = None
+    position: str = "next"
+    base_price: int | None = None
+
+def _queue_player(code, authorization, payload):
+    def mutate(db, room):
+        queue_player(db, room, player_id=payload.player_id, new=payload.new,
+                     position=payload.position, base_price=payload.base_price)
+    return _locked_host_mutation(code, authorization, mutate)
+
+@app.post("/api/rooms/{code}/queue-player")
+async def queue_player_endpoint(code: str, payload: QueuePlayerRequest, authorization: str | None = Header(default=None)):
+    """Host: make a pool player (or a brand-new one) the next to come up, or send them to the end of the queue."""
+    _ensure_loop()
+    if payload.player_id is None and not payload.new:
+        raise HTTPException(400, "Choose a player or enter a new one")
+    result = await asyncio.to_thread(_queue_player, code, authorization, payload)
+    if result["room"]["status"] == "LIVE":
+        arm_timer(code)
     return result
 
 def _nominate(code, authorization, payload):

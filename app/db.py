@@ -36,3 +36,14 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_columns():
+    """create_all() never alters an existing table, so add columns introduced after a database was first created."""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    if "lots" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("lots")}
+        if "timer_seconds" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE lots ADD COLUMN timer_seconds FLOAT"))

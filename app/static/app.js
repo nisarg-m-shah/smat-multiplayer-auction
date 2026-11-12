@@ -100,7 +100,7 @@ async function render(s){
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
  state=s;lastSnapshot=s;bidFieldsVersion=0;noteSnapshotTime(s);
  franchiseOrder=(s.franchises||[]).map(f=>Number(f.id));
- if(isHost){show("access-panel");const key=franchiseOrder.join(",")+"|"+(s.room.host_franchise_id||"");if(key!==render._accessKey){render._accessKey=key;if(lastCreds&&!$("invite-output").classList.contains("hidden"))showCredentials(lastCreds);if($("access-details").open)loadCredentials()}}
+ if(isHost){show("access-panel");const key=franchiseOrder.join(",")+"|"+(s.room.host_franchise_id||"");if(key!==render._accessKey){render._accessKey=key;if($("access-details").open)loadCredentials()}}
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
@@ -148,7 +148,7 @@ async function render(s){
  hide("final-results");
  const betweenLots=!s.current_player&&s.room.status==="BETWEEN_LOTS";
  const resultEvent=betweenLots?(s.events||[]).find(e=>e.kind==="SOLD"||e.kind==="UNSOLD"):null;
- $("queue-label").textContent=(s.queue_remaining||0)+" in queue";
+ $("queue-label").textContent=(s.queue_remaining||0)+" in queue"+(s.next_up?" · Next: "+s.next_up.name:"");
  if(resultEvent){
   // SOLD / UNSOLD replaces the bidding area; the server opens the next player only after this has been shown.
   clearInterval(timerInterval);
@@ -156,7 +156,7 @@ async function render(s){
   updateBidButton();
  }else if(s.current_player){
   const p=s.current_player;show("live-area");hideResult();
-  $("player-name").textContent=p.name;paintRole(p.role);$("player-team").textContent=p.state_team||"";
+  $("player-name").textContent=p.name;paintRole(p.role);$("player-team").textContent=p.state_team||"";{const ck=$("player-clock"),extra=Math.round((Number(p.timer_seconds)||0)-(Number(s.room.timer_seconds)||0));ck.textContent=`+${extra}s clock`;ck.classList.toggle("hidden",!(extra>0))}
   $("round-label").textContent="ROUND "+p.round_no;$("base-price").textContent=money(p.base_price);$("current-bid").textContent=money(p.current_bid||p.base_price);
   paintBid();
   startLocalTimer(p.ends_at,p.remaining_ms);
@@ -303,13 +303,18 @@ function hostFranchiseOptions(s){
  return `<option value="">Host only — not bidding</option>`+(s.franchises||[]).map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join("");
 }
 function syncHostFranchisePickers(s){
- const options=hostFranchiseOptions(s);
- ["host-franchise-setup","host-franchise-live"].forEach(id=>{
-  const el=$(id);if(!el)return;el.innerHTML=options;el.value=s.room.host_franchise_id||"";
- });
+ const sel=String(s.room.host_franchise_id||"");
+ const live=$("host-franchise-live");
+ if(live){const k="L"+(s.franchises||[]).map(f=>f.id+f.name).join(",");if(live.dataset.k!==k){live.dataset.k=k;live.innerHTML=hostFranchiseOptions(s)}live.value=sel}
+ const box=$("host-franchise-chips");if(!box)return;
+ const opts=[{id:"",name:"Host only"},...(s.franchises||[]).map(f=>({id:String(f.id),name:f.name}))];
+ const k=opts.map(o=>o.id+o.name).join("|")+"#"+sel+"#"+s.room.status;
+ if(box.dataset.k===k)return;box.dataset.k=k;
+ const locked=s.room.status!=="SETUP";
+ box.innerHTML=opts.map(o=>`<button type="button" role="radio" aria-checked="${o.id===sel}" class="fr-chip${o.id===sel?" on":""}" data-fid="${o.id}" ${locked?"disabled":""}>${esc(o.name)}</button>`).join("");
+ box.querySelectorAll(".fr-chip").forEach(b=>b.onclick=()=>updateHostFranchise(b.dataset.fid));
 }
 function renderFinalResults(s){
- hide("invite-output");
  const franchises=s.franchises||[];
  const totalPlayers=franchises.reduce((n,f)=>n+(f.squad_count||0),0);
  const totalSpent=franchises.reduce((n,f)=>n+Math.max(0,(s.room.purse||0)-(f.purse_remaining||0)),0);
@@ -325,7 +330,7 @@ function renderFinalResults(s){
   return `<article class="final-team panel${isMine(f)?" mine":""}">
    <div class="final-team-head"><div><div class="eyebrow">FINAL SQUAD${isMine(f)?'<span class="you-tag">Your team</span>':""}</div><h3>${esc(f.name)}</h3></div><div class="final-team-count">${squad.length} / ${s.room.max_squad}</div></div>
    <div class="final-team-metrics"><div><span>Spent</span><strong>${money(spent)}</strong></div><div><span>Remaining purse</span><strong>${money(f.purse_remaining)}</strong></div></div>
-   ${squad.length?`<div class="table-wrap"><table class="final-squad-table"><thead><tr><th>#</th><th>Player</th><th>State team</th><th>Role</th><th>Price</th></tr></thead><tbody>${squad.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.player)}</td><td>${esc(p.state_team||"—")}</td><td>${esc(p.role||"—")}</td><td>${money(p.price)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="muted">No players purchased.</p>`}
+   ${squad.length?`<div class="table-wrap"><table class="final-squad-table"><thead><tr><th>#</th><th>Player</th><th class="col-state">State team</th><th class="col-state">Role</th><th>Price</th></tr></thead><tbody>${squad.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.player)}</td><td>${esc(p.state_team||"—")}</td><td>${esc(p.role||"—")}</td><td>${money(p.price)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="muted">No players purchased.</p>`}
   </article>`;
  }).join("");
 }
@@ -421,13 +426,13 @@ function startLocalTimer(endsAt,remainingMs){
  clearInterval(timerInterval);
  if(!endsAt){
   // Paused: show the time that will be on the clock when bidding resumes.
-  const total=Math.max(1,Number(state?.room?.timer_seconds)||10),sec=Math.max(0,(Number(remainingMs)||0)/1000);
+  const total=Math.max(1,Number(state?.current_player?.timer_seconds||state?.room?.timer_seconds)||10),sec=Math.max(0,(Number(remainingMs)||0)/1000);
   $("timer").textContent=remainingMs!=null?sec.toFixed(1):"PAUSED";
   $("timer-fill").style.width=Math.min(100,100*sec/total)+"%";
   setTimerState("paused");return}
  const normalizedEndsAt=/([zZ]|[+-]\d{2}:?\d{2})$/.test(endsAt)?endsAt:endsAt+"Z";
  const deadline=new Date(normalizedEndsAt).getTime();
- const total=Math.max(1,Number(state?.room?.timer_seconds)||10);
+ const total=Math.max(1,Number(state?.current_player?.timer_seconds||state?.room?.timer_seconds)||10);
  let lastWhole=null,buzzed=false;
  const update=()=>{
   const sec=Math.max(0,(deadline-serverNow())/1000);
@@ -655,7 +660,7 @@ async function loadPool(){pool=await api(`/api/rooms/${roomCode}/pool`);renderPo
 function renderPool(){
  const q=$("pool-search").value.toLowerCase();
  const rows=pool.filter(p=>(p.name+" "+p.state_team+" "+p.role).toLowerCase().includes(q));
- $("pool-table").innerHTML=`<table><thead><tr><th>Include</th><th>Player</th><th>State team</th><th>Role</th><th>Base</th><th>Importance</th></tr></thead><tbody>${rows.map(p=>`<tr><td><input type="checkbox" data-player="${p.id}" ${p.included?"checked":""}></td><td>${esc(p.name)}</td><td>${esc(p.state_team)}</td><td>${esc(p.role)}</td><td><input class="small-input" type="number" data-price="${p.id}" value="${p.base_price}"></td><td><input class="small-input" type="number" min=".01" step=".1" data-weight="${p.id}" value="${p.importance_weight}"></td></tr>`).join("")}</tbody></table>`;
+ $("pool-table").innerHTML=`<table><thead><tr><th>Include</th><th>Player</th><th class="col-state">State team</th><th class="col-state">Role</th><th>Base</th><th>Importance</th></tr></thead><tbody>${rows.map(p=>`<tr><td><input type="checkbox" data-player="${p.id}" ${p.included?"checked":""}></td><td>${esc(p.name)}<small class="pt-state">${esc(p.role)}${p.state_team?" · "+esc(p.state_team):""}</small></td><td class="col-state">${esc(p.state_team)}</td><td class="col-state">${esc(p.role)}</td><td><input class="small-input" type="number" data-price="${p.id}" value="${p.base_price}"></td><td><input class="small-input" type="number" min=".01" step=".1" data-weight="${p.id}" value="${p.importance_weight}"></td></tr>`).join("")}</tbody></table>`;
  $("pool-table").querySelectorAll("[data-player]").forEach(el=>el.onchange=async()=>{await api(`/api/rooms/${roomCode}/players/${el.dataset.player}`,{method:"PATCH",body:JSON.stringify({included:el.checked})});const p=pool.find(x=>x.id==el.dataset.player);p.included=el.checked});
  $("pool-table").querySelectorAll("[data-price]").forEach(el=>el.onchange=async()=>{await api(`/api/rooms/${roomCode}/players/${el.dataset.price}`,{method:"PATCH",body:JSON.stringify({base_price:Number(el.value)})})});
  $("pool-table").querySelectorAll("[data-weight]").forEach(el=>el.onchange=async()=>{await api(`/api/rooms/${roomCode}/players/${el.dataset.weight}`,{method:"PATCH",body:JSON.stringify({importance_weight:Number(el.value)})})});
@@ -666,14 +671,16 @@ async function updateHostFranchise(value){
   const d=await api(`/api/rooms/${roomCode}/host/select-franchise`,{method:"POST",body:JSON.stringify({franchise_id:value?Number(value):null})});
   const selected=(d.franchises||[]).find(f=>Number(f.id)===Number(value));
   myFranchise=selected?{id:selected.id,name:selected.name}:null;
-  $("role-label").textContent=myFranchise?` · Host / ${myFranchise.name}`:" · Administrator";
+  paintRoleLabel();
   render(d);
  }catch(e){alert(e.message);render(state)}
 }
-$("host-franchise-setup").onchange=e=>updateHostFranchise(e.target.value);
 $("add-player").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api(`/api/rooms/${roomCode}/players`,{method:"POST",body:JSON.stringify(Object.fromEntries(f))});e.target.reset();await loadPool()}catch(err){alert(err.message)}};
 $("csv-upload").onchange=async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append("file",f);try{const r=await fetch(`/api/rooms/${roomCode}/players/import-csv`,{method:"POST",headers:{"Authorization":"Bearer "+token},body:fd});const d=await r.json();if(!r.ok)throw Error(d.detail);alert("Imported "+d.imported+" players");await loadPool()}catch(err){alert(err.message)}};
-function renderUnsold(list){$("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label><input type="checkbox" value="${p.player_id}"> ${esc(p.name)} <span class="muted">(${esc(roleLabel(p.role))}${p.state_team?" · "+esc(p.state_team):""})</span> — base ${money(p.base_price)}</label><input class="small-input" type="number" min="1" data-unsold-price="${p.player_id}" placeholder="Keep ${p.base_price}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
+function renderUnsold(list){
+ const keep=new Set([...$("unsold-list").querySelectorAll('input[type="checkbox"]:checked')].map(x=>x.value));
+ const prices={};$("unsold-list").querySelectorAll("[data-unsold-price]").forEach(x=>{if(x.value)prices[x.dataset.unsoldPrice]=x.value});
+ $("unsold-list").innerHTML=list.map(p=>`<div class="unsold-row"><label class="u-pick"><input type="checkbox" value="${p.player_id}" ${keep.has(String(p.player_id))?"checked":""}><span class="u-name"><b>${esc(p.name)}</b><small>${esc(roleLabel(p.role))}${p.state_team?" · "+esc(p.state_team):""}</small></span></label><span class="u-base"><small>base</small><b>${money(p.base_price)}</b></span><input class="small-input u-price" type="number" min="1" inputmode="numeric" data-unsold-price="${p.player_id}" placeholder="New base" value="${esc(prices[p.player_id]||"")}" title="Optional new base price"></div>`).join("")||'<p class="muted">No unsold players yet.</p>'}
 $("nominate").onclick=async()=>{
  const ids=[...$("unsold-list").querySelectorAll('input[type="checkbox"]:checked')].map(x=>Number(x.value));
  const price_overrides={};$("unsold-list").querySelectorAll("[data-unsold-price]").forEach(x=>{if(x.value.trim()!=="")price_overrides[x.dataset.unsoldPrice]=Number(x.value)});
@@ -693,21 +700,13 @@ async function copyText(t,btn){
 }
 let lastCreds=null;
 function showCredentials(d){
- lastCreds=d;
- const hfId=state?.room?.host_franchise_id,hf=hfId&&(state.franchises||[]).find(f=>Number(f.id)===Number(hfId));
- // If the host plays as a franchise, that franchise is the host login: no separate row or password for it.
- const rows=[{franchise:hf?hf.name:d.host_login.franchise,password:d.host_login.password,host:true,label:hf?"HOST":null},...d.credentials.filter(c=>!hf||c.franchise!==hf.name)];
- const box=$("invite-output");
- box.innerHTML=`<div class="section-head"><div><h2>Auction created</h2><p class="muted">Send each person their franchise name, password and the room code. You can look these up again any time in <b>Franchise passwords</b> at the bottom of the page.</p></div>
-  <button class="secondary" id="cred-copy-all" type="button">Copy all</button></div>
-  <div class="room-code-card"><span class="lbl">Room code</span><strong>${esc(d.room_code)}</strong><span class="muted">${esc(location.origin)}</span></div>
-  <div class="cred-list">${rows.map((r,i)=>`<div class="cred-row${r.host?" host":""}"><div class="cred-name">${r.host?'<span class="host-tag">HOST</span>':badgeHTML(r.franchise,i)}<b>${esc(r.franchise)}</b></div><code class="cred-pw">${esc(r.password)}</code><button class="ghost small" type="button" data-copy="${i}">Copy invite</button></div>`).join("")}</div>
-  <button class="ghost small" id="cred-dismiss" type="button">I have saved these</button>`;
- box.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>{const r=rows[+b.dataset.copy];copyText(inviteText(d.room_code,r.franchise,r.password),b)});
- $("cred-copy-all").onclick=e=>copyText(rows.map(r=>inviteText(d.room_code,r.franchise,r.password)).join("\n\n"),e.target);
- $("cred-dismiss").onclick=()=>hide("invite-output");
- show("invite-output");
+ // Logins live only in the "Franchise passwords" panel at the bottom of the page. A room that was just created
+ // keeps its creation-time passwords as a fallback in case the lookup fails.
+ lastCreds=d;credData=null;
+ const det=$("access-details");det.open=true;loadCredentials();
 }
+function scrollToPasswords(){const d=$("access-details");d.open=true;loadCredentials();$("access-panel").scrollIntoView({behavior:"smooth",block:"start"})}
+const gp=$("goto-passwords");if(gp)gp.onclick=scrollToPasswords;
 let namesTimer=null;
 async function loadFranchiseNames(){
  const code=$("login-room").value.trim().toUpperCase(),sel=$("login-franchise");
@@ -780,8 +779,20 @@ function sideTabActive(){return document.querySelector(".side-tab.active")?.data
 async function loadAuctionPool(force){
  if(poolLoading||!roomCode||!token)return;
  poolLoading=true;
- try{poolData=await api(`/api/rooms/${roomCode}/pool`);renderAuctionPool()}catch(e){}finally{poolLoading=false}
+ try{poolData=await api(`/api/rooms/${roomCode}/auction-pool`);renderAuctionPool()}catch(e){}finally{poolLoading=false}
 }
+async function queuePlayer(body,btn){
+ if(btn)btn.disabled=true;
+ try{const d=await api(`/api/rooms/${roomCode}/queue-player`,{method:"POST",body:JSON.stringify(body)});render(d);loadAuctionPool();return true}
+ catch(e){if(!(e instanceof AuthError))alert(e.message);return false}
+ finally{if(btn)btn.disabled=false}
+}
+$("pool-view-list").addEventListener("click",e=>{const b=e.target.closest("[data-next]");if(b)queuePlayer({player_id:Number(b.dataset.next),position:"next"},b)});
+$("live-add-player").onsubmit=async e=>{
+ e.preventDefault();const f=Object.fromEntries(new FormData(e.target));
+ const ok=await queuePlayer({new:{name:f.name,state_team:f.state_team,role:f.role,base_price:Number(f.base_price)||20},position:f.position},e.submitter);
+ if(ok){e.target.reset();e.target.base_price.value=20}
+};
 function renderAuctionPool(){
  if(!poolData)return;
  for(const k of ["UPCOMING","SOLD","UNSOLD"])$("pc-"+k).textContent=(poolData.counts[k]||0)+(k==="UPCOMING"?(poolData.counts.LIVE||0):0);
@@ -795,13 +806,13 @@ function renderAuctionPool(){
    <span class="role-dot" data-role="${esc(String(p.role||"").toUpperCase())}"></span>
    <div class="pr-name"><b>${esc(p.name)}</b><small>${esc(roleLabel(p.role))}${p.state_team?" · "+esc(p.state_team):""}</small></div>
    ${p.status==="SOLD"?`<div class="pr-end"><strong>${money(p.price)}</strong><small>${esc(p.franchise||"")}</small></div>`
-    :p.status==="LIVE"?`<span class="chip lead on">On the block</span>`:`<div class="pr-end"><strong>${money(p.base_price)}</strong><small>base</small></div>`}
+    :p.status==="LIVE"?`<span class="chip lead on">On the block</span>`:`<div class="pr-end"><strong>${money(p.base_price)}</strong><small>base</small></div>${p.next?'<span class="chip nextup">Next up</span>':isHost&&state?.room?.status!=="COMPLETED"?`<button type="button" class="next-btn" data-next="${p.id}" title="Make ${esc(p.name)} the next player">Next</button>`:""}`}
   </div>`).join(""):`<p class="muted pool-empty">${q?"No players match your search.":poolFilter==="SOLD"?"Nobody has been sold yet.":poolFilter==="UNSOLD"?"No unsold players so far.":"No players left in the pool."}</p>`;
 }
 document.querySelectorAll(".pf").forEach(b=>b.onclick=()=>{poolFilter=b.dataset.pool;renderAuctionPool()});
 $("pool-view-search").addEventListener("input",renderAuctionPool);
 function refreshPoolIfNeeded(s){
- const key=`${s.room.status}|${s.current_player?.lot_id||""}|${(s.unsold||[]).length}|${s.franchises.reduce((t,f)=>t+f.squad_count,0)}`;
+ const key=`${s.room.status}|${s.current_player?.lot_id||""}|${s.queue_remaining||0}|${s.next_up?.player_id||""}|${(s.unsold||[]).length}|${s.franchises.reduce((t,f)=>t+f.squad_count,0)}`;
  if(key===poolKey)return;poolKey=key;
  if(sideTabActive()==="pool"||!poolData)loadAuctionPool();
 }
@@ -815,8 +826,10 @@ function renderAccess(){
  const el=$("access-live");if(!el)return;
  if(!credData){el.innerHTML='<p class="muted">Loading…</p>';return}
  const hid=credData.host_franchise_id,hf=hid&&credData.franchises.find(f=>Number(f.id)===Number(hid));
- const rows=[{key:"host",label:hf?hf.name:credData.host.franchise,host:true,badgeId:hf?hf.id:0,password:credData.host.password},
-  ...credData.franchises.filter(f=>!hf||f.id!==hf.id).map(f=>({key:String(f.id),id:f.id,label:f.name,badgeId:f.id,password:f.password}))];
+ const made=lastCreds&&lastCreds.room_code===roomCode?lastCreds:null;
+ const madePw=n=>made?(made.credentials||[]).find(c=>c.franchise===n)?.password:null;
+ const rows=[{key:"host",label:hf?hf.name:credData.host.franchise,host:true,badgeId:hf?hf.id:0,password:credData.host.password||(made&&made.host_login?.password)||null},
+  ...credData.franchises.filter(f=>!hf||f.id!==hf.id).map(f=>({key:String(f.id),id:f.id,label:f.name,badgeId:f.id,password:f.password||madePw(f.name)||null}))];
  el.innerHTML=`<p class="muted">Sign in with the room code, the franchise name and its password. Anyone can use their password on any number of devices.</p>
   <div class="room-code-line"><span class="lbl">Room code</span><b>${esc(roomCode)}</b><button class="ghost small" id="cred-copyall" type="button">Copy all invites</button></div>
   <div class="cred-list">${rows.map(r=>`<div class="cred-row${r.host?" host":""}" data-key="${r.key}">

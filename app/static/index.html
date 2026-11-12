@@ -73,16 +73,15 @@
     <!-- ───────── room ───────── -->
     <section id="room" class="hidden">
 
-      <!-- credentials shown right after a room is created -->
-      <section id="invite-output" class="panel hidden"></section>
 
       <!-- host: pool management before the auction starts -->
       <div id="host-setup" class="panel hidden">
         <div class="section-head">
-          <div><h2>Auction pool</h2><p class="muted">Remove players who should not be available. A higher importance weight means a better chance of appearing earlier.</p></div>
+          <div><h2>Auction pool</h2><p class="muted">Remove players who should not be available. A higher importance weight means a better chance of appearing earlier. In 25-second auctions it also gives that player a longer clock, up to half the timer extra for the highest weight.</p></div>
           <button id="start-auction" class="primary">Lock pool &amp; start</button>
         </div>
-        <div class="host-franchise-picker"><label>My franchise (host participation)<select id="host-franchise-setup"><option value="">Host only — not bidding</option></select></label><p class="muted">Choose the franchise you will manage and bid for. This choice locks when the auction starts.</p></div>
+        <div class="host-franchise-picker"><span class="lbl">Do you want to bid too?</span><div id="host-franchise-chips" class="fr-chips" role="radiogroup" aria-label="My franchise"></div><p class="muted">Pick the franchise you will manage and bid for, or host only. This locks when the auction starts.</p></div>
+        <p class="pw-hint muted">Franchise logins are in <button id="goto-passwords" class="linkish" type="button">Franchise passwords</button> at the bottom of the page.</p>
         <div class="toolbar"><input id="pool-search" placeholder="Search player, state team or role"><label class="upload">Import CSV<input id="csv-upload" type="file" accept=".csv"></label></div>
         <div id="pool-table" class="table-wrap"></div>
         <details class="add-player"><summary>Add a player manually</summary><form id="add-player" class="inline-form"><input name="name" placeholder="Player name" required><input name="state_team" placeholder="State team"><select name="role"><option>BAT</option><option>AR</option><option>BOWL</option><option>WK</option><option>UNKNOWN</option></select><input name="base_price" type="number" value="20"><input name="importance_weight" type="number" min="0.01" step="0.1" value="1"><button class="secondary">Add</button></form></details>
@@ -100,19 +99,32 @@
             <button data-action="redo-bid" class="ctl">Redo <span class="opt">last </span>bid</button>
             <button data-action="undo-sale" class="ctl warn">Undo <span class="opt">last </span>player</button>
             <button data-action="redo-sale" class="ctl">Redo <span class="opt">last </span>player</button>
-            <button data-action="finish" class="ctl danger">End auction</button>
             <button id="host-more" class="ctl more" type="button" aria-expanded="false" aria-controls="admin-controls">More <i class="chev" aria-hidden="true"></i></button>
           </div>
         </section>
 
         <!-- more host tools: a drawer that opens right under the bar -->
         <section id="admin-controls" class="panel drawer drawer-closed hidden">
+          <details class="tool" id="next-tool"><summary>Next player: add or pick</summary>
+            <div class="next-tool">
+              <p class="muted">To pick someone already in the pool, open the <b>Pool</b> tab and tap <b>Next</b> beside them. To bring in someone who is not in the pool at all, add them here.</p>
+              <form id="live-add-player" class="live-add">
+                <input name="name" placeholder="Player name" required autocomplete="off">
+                <input name="state_team" placeholder="State team" autocomplete="off">
+                <select name="role"><option value="BAT">Batter</option><option value="AR">All-rounder</option><option value="BOWL">Bowler</option><option value="WK">Keeper</option><option value="UNKNOWN">Other</option></select>
+                <input name="base_price" type="number" min="1" placeholder="Base price" value="20" inputmode="numeric">
+                <select name="position"><option value="next">Next up</option><option value="end">End of queue</option></select>
+                <button class="secondary" type="submit">Add player</button>
+              </form>
+            </div>
+          </details>
           <details class="tool"><summary>My franchise</summary>
             <div class="host-franchise-picker"><label><select id="host-franchise-live" disabled><option value="">Host only — not bidding</option></select></label><p class="muted">Your franchise selection is locked for this auction.</p></div>
           </details>
           <details class="tool"><summary>Unsold-only round</summary>
             <div class="nomination"><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players &amp; start unsold-only round</button></div>
           </details>
+          <div class="end-row"><button data-action="finish" class="end-btn" type="button">End auction…</button></div>
         </section>
 
         <section class="auction-grid">
@@ -127,7 +139,7 @@
             <!-- live bidding -->
             <div id="bid-stage" class="bid-stage">
               <div class="player-top">
-                <div class="player-meta"><span id="player-role" class="role-chip" data-role="">PLAYER</span><span id="player-team" class="state-chip"></span></div>
+                <div class="player-meta"><span id="player-role" class="role-chip" data-role="">PLAYER</span><span id="player-team" class="state-chip"></span><span id="player-clock" class="state-chip clock-chip hidden" title="Important players get a longer clock"></span></div>
                 <h2 id="player-name">Waiting for player</h2>
               </div>
               <div class="price-grid">

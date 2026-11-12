@@ -67,6 +67,8 @@ class Lot(Base):
     bid_sequence: Mapped[int] = mapped_column(Integer, default=0)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     settlement_redo_available: Mapped[bool] = mapped_column(Boolean, default=False)
+    # This player's own clock length (important players get longer). NULL = the room's timer (older lots).
+    timer_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 class Bid(Base):
     __tablename__ = "bids"

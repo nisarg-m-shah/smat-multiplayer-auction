@@ -52,7 +52,7 @@ def test_everyone_out_with_one_leader_shortens_the_clock_then_sells(client):
         assert _pass(a, who).status_code == 200
     _, lot = a.db_lot()
     from app.engine import seconds_until
-    assert seconds_until(lot.ends_at) <= 1.6
+    assert 11.0 <= seconds_until(lot.ends_at) <= 12.6      # half of 25s, not ~0
     a.set_deadline(-1.5)
     settled, _, _ = main._settle_expired_lot(a.code)
     assert settled and a.count(Sale, reversed=False) == 1
@@ -64,7 +64,7 @@ def test_nobody_bid_and_everyone_out_goes_unsold(client):
         assert _pass(a, who).status_code == 200
     _, lot = a.db_lot()
     from app.engine import seconds_until
-    assert seconds_until(lot.ends_at) <= 1.6
+    assert 11.0 <= seconds_until(lot.ends_at) <= 12.6      # half of 25s, not ~0
     a.set_deadline(-1.5)
     main._settle_expired_lot(a.code)
     assert a.count(Sale, reversed=False) == 0
@@ -99,7 +99,7 @@ def test_pool_lists_upcoming_sold_and_unsold(client):
     n = _names(a)
     a.bid(n[0], 100); a.set_deadline(-1); main._settle_expired_lot(a.code)     # sold
     a.set_deadline(-1); main._settle_expired_lot(a.code)                        # unsold
-    r = client.get(f"/api/rooms/{a.code}/pool", headers=a.H(n[1])).json()
+    r = client.get(f"/api/rooms/{a.code}/auction-pool", headers=a.H(n[1])).json()
     c = r["counts"]
     assert c["SOLD"] == 1 and c["UNSOLD"] == 1 and c["LIVE"] + c["UPCOMING"] == 2
     sold = [p for p in r["players"] if p["status"] == "SOLD"][0]

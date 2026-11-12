@@ -1,4 +1,4 @@
-import os, secrets
+import math, os, secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from threading import RLock, Lock
@@ -108,6 +108,24 @@ def create_queue(db: Session, room: Room, players: list[Player], round_no=1):
         db.add(Lot(room_id=room.id, player_id=p.id, round_no=round_no,
                    queue_order=offset+i, status="QUEUED", base_price=p.base_price))
 
+def window_for_player(db: Session, room: Room, player: Player) -> float:
+    """Length of this player's clock. Normally the room timer. In rooms with a timer of 25 s or more, a player
+    whose importance weight is above 1 gets up to half the timer extra (for the pool's highest weight),
+    scaled logarithmically against that highest weight and rounded to whole seconds."""
+    base = float(room.timer_seconds)
+    if base < config.IMPORTANCE_MIN_TIMER or player.importance_weight <= 1:
+        return base
+    top = db.scalar(select(func.max(Player.importance_weight)).where(
+        Player.room_id == room.id, Player.included == True)) or 1.0
+    if top <= 1:
+        return base
+    frac = min(1.0, math.log(player.importance_weight) / math.log(top))
+    return base + int(base * config.IMPORTANCE_TIMER_BONUS * frac + 0.5)
+
+def lot_window(room: Room, lot: Lot) -> float:
+    """This lot's own clock length (no database access: used on the bid hot path)."""
+    return float(lot.timer_seconds or room.timer_seconds)
+
 def open_next_lot(db: Session, room: Room):
     lot = db.scalar(select(Lot).where(
         Lot.room_id == room.id, Lot.status == "QUEUED"
@@ -121,7 +139,8 @@ def open_next_lot(db: Session, room: Room):
     lot.current_bid = 0
     lot.highest_franchise_id = None
     lot.bid_sequence = 0
-    lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+    lot.timer_seconds = window_for_player(db, room, db.get(Player, lot.player_id))
+    lot.ends_at = now_utc() + timedelta(seconds=lot.timer_seconds)
     lot.remaining_ms = None
     room.current_lot_id = lot.id
     room.status = "LIVE"
@@ -364,7 +383,8 @@ def apply_bid(db: Session, ctx: BidContext, amount: int) -> dict:
     if room.bid_extension:
         # Add half the configured timer, but never extend beyond one full timer window from now.
         old_remaining = max(0.0, seconds_until(lot.ends_at))
-        new_remaining = min(room.timer_seconds, old_remaining + room.timer_seconds / 2)
+        window = lot_window(room, lot)
+        new_remaining = min(window, old_remaining + window / 2)
         new_ends = now + timedelta(seconds=new_remaining)
     if ctx.has_redo:
         # A new bid after an undo creates a new branch; discard the old redo path.
@@ -455,7 +475,7 @@ def pause_room(db: Session, room: Room):
     lot = current_lot(db, room)
     # Pausing never leaves less than half the timer, so everyone has time to settle after the pause
     # (lag, a fix, a reconnect) instead of resuming into the last second.
-    floor_ms = int(room.timer_seconds * 500)
+    floor_ms = int(lot_window(room, lot) * 500)
     lot.remaining_ms = max(floor_ms, int(seconds_until(lot.ends_at) * 1000))
     lot.ends_at = None
     lot.status = "PAUSED"
@@ -528,11 +548,11 @@ def undo_last_sale(db: Session, room: Room):
     if was_paused:
         lot.status = "PAUSED"
         lot.ends_at = None
-        lot.remaining_ms = room.timer_seconds * 1000
+        lot.remaining_ms = lot_window(room, lot) * 1000
         room.status = "PAUSED"
     else:
         lot.status = "LIVE"
-        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+        lot.ends_at = now_utc() + timedelta(seconds=lot_window(room, lot))
         lot.remaining_ms = None
         room.status = "LIVE"
     lot.settlement_redo_available = True
@@ -556,9 +576,9 @@ def _reset_clock(room: Room, lot: Lot):
     """Full timer after an undo/redo of a bid. A paused room stays paused: the full timer is held until resume."""
     if lot.status == "PAUSED":
         lot.ends_at = None
-        lot.remaining_ms = room.timer_seconds * 1000
+        lot.remaining_ms = lot_window(room, lot) * 1000
     else:
-        lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds)
+        lot.ends_at = now_utc() + timedelta(seconds=lot_window(room, lot))
 
 def undo_last_bid(db: Session, room: Room):
     lot = current_lot(db, room)
@@ -714,6 +734,71 @@ def nominated_unsold(db: Session, room: Room, player_ids: list[int], price_overr
     open_next_lot(db, room)
 
 
+def queue_player(db: Session, room: Room, *, player_id=None, new=None, position="next", base_price=None):
+    """Host: put one player (from the pool, or a brand-new one) at the front of the queue ("next") or at the
+    back ("end"). A player already waiting in the queue is moved rather than duplicated. A sold player cannot
+    be queued, and neither can the one on the block. If the round had already run out of players, the
+    chosen player is opened straight away."""
+    if room.status in ("SETUP", "COMPLETED"):
+        raise ValueError("The auction must be running to queue a player")
+    if position not in ("next", "end"):
+        raise ValueError("Position must be next or end")
+    if new is not None:
+        name = (new.get("name") or "").strip()
+        if not name:
+            raise ValueError("Player name is required")
+        team = (new.get("state_team") or "").strip()
+        if db.scalar(select(Player).where(Player.room_id == room.id, Player.name == name, Player.state_team == team)):
+            raise ValueError("That player is already in the pool. Pick them from the list instead")
+        base = int(new.get("base_price") or config.DEFAULT_BASE_PRICE)
+        top = db.scalar(select(func.max(Player.source_order)).where(Player.room_id == room.id)) or 0
+        player = Player(room_id=room.id, name=name, state_team=team, role=(new.get("role") or "UNKNOWN").upper(),
+                        base_price=base, importance_weight=float(new.get("importance_weight") or 1.0),
+                        included=True, source_order=top + 1)
+        db.add(player)
+        db.flush()
+    else:
+        player = db.scalar(select(Player).where(Player.id == player_id, Player.room_id == room.id))
+        if not player:
+            raise ValueError("Player not found")
+    if base_price is not None and int(base_price) < 1:
+        raise ValueError("Base price must be at least 1")
+    if db.scalar(select(Sale.id).where(Sale.room_id == room.id, Sale.player_id == player.id, Sale.reversed == False).limit(1)):
+        raise ValueError(f"{player.name} has already been sold")
+    on_block = current_lot(db, room)
+    if on_block is not None and on_block.player_id == player.id and on_block.status in ("LIVE", "PAUSED"):
+        raise ValueError(f"{player.name} is on the block right now")
+
+    queued = db.scalars(select(Lot).where(Lot.room_id == room.id, Lot.status == "QUEUED")
+                        .order_by(Lot.round_no, Lot.queue_order)).all()
+    mine = next((l for l in queued if l.player_id == player.id), None)
+    others = [l for l in queued if l is not mine]
+    if others:
+        anchor = others[0] if position == "next" else others[-1]
+        round_no = anchor.round_no
+        order = anchor.queue_order - 1 if position == "next" else anchor.queue_order + 1
+    else:
+        round_no = db.scalar(select(func.max(Lot.round_no)).where(Lot.room_id == room.id)) or 1
+        order = 0
+    price = int(base_price) if base_price is not None else (mine.base_price if mine else player.base_price)
+    if mine is not None:
+        mine.round_no, mine.queue_order, mine.base_price = round_no, order, price
+        lot = mine
+    else:
+        lot = Lot(room_id=room.id, player_id=player.id, round_no=round_no, queue_order=order,
+                  status="QUEUED", base_price=price)
+        db.add(lot)
+    player.included = True
+    event(db, room.id, "NEXT_UP" if position == "next" else "QUEUED",
+          f"{player.name} added " + ("as the next player." if position == "next" else "to the end of the queue."),
+          {"player_id": player.id, "position": position})
+    db.flush()
+    opened = None
+    if room.status == "ROUND_COMPLETE":
+        opened = open_next_lot(db, room)
+    return player, opened
+
+
 def recover_interrupted_rooms(db: Session):
     """Pause live rooms after restart without changing accepted bids or sales."""
     rooms = db.scalars(select(Room).where(Room.status == "LIVE")).all()
@@ -724,7 +809,7 @@ def recover_interrupted_rooms(db: Session):
             # The timer intentionally restarts at its configured full duration.
             lot.status = "PAUSED"
             lot.ends_at = None
-            lot.remaining_ms = room.timer_seconds * 1000
+            lot.remaining_ms = lot_window(room, lot) * 1000
             room.status = "PAUSED"
             room.version += 1
             event(db, room.id, "RECOVERED_PAUSED",
@@ -746,7 +831,7 @@ def recover_interrupted_rooms(db: Session):
         if lot is not None:
             lot.status = "PAUSED"
             lot.ends_at = None
-            lot.remaining_ms = room.timer_seconds * 1000
+            lot.remaining_ms = lot_window(room, lot) * 1000
             room.status = "PAUSED"
             event(db, room.id, "RECOVERED_PAUSED",
                   "Server restarted between players. The next player is ready and paused; resume starts a fresh timer.",
@@ -803,7 +888,7 @@ def snapshot(db: Session, room: Room):
             "highest_franchise": next((f.name for f in franchises if f.id == live.highest_franchise_id), None),
             "ends_at": iso_utc(live.ends_at), "remaining_ms": live.remaining_ms,
             "status": live.status, "round_no": live.round_no,
-            "next_bid": next_bid_amount(live),
+            "next_bid": next_bid_amount(live), "timer_seconds": lot_window(room, live),
             "out_ids": sorted(out_ids_for_lot(db, live)) if live.status in ("LIVE", "PAUSED") else []
         }
     latest_lot_by_player = {}
@@ -825,6 +910,9 @@ def snapshot(db: Session, room: Room):
         } for f in franchises],
         "current_player": current_player,
         "queue_remaining": sum(1 for l in lots if l.status == "QUEUED"),
+        "next_up": next(({"player_id": l.player_id, "name": players[l.player_id].name, "role": players[l.player_id].role,
+                          "state_team": players[l.player_id].state_team, "base_price": l.base_price}
+                         for l in lots if l.status == "QUEUED"), None),
         "unsold": [{
             "player_id": l.player_id, "name": players[l.player_id].name,
             "role": players[l.player_id].role, "state_team": players[l.player_id].state_team,
@@ -880,11 +968,12 @@ def everyone_is_out(db: Session, room: Room, lot: Lot) -> bool:
     return not (active - ({leader} if leader else set()))
 
 def close_if_everyone_out(db: Session, room: Room, lot: Lot) -> bool:
-    """Shorten the clock to a moment when nobody is left to bid: the lot then sells (one franchise left)
-    or goes unsold (none left) through the normal settlement path."""
+    """When nobody is left to bid, trim the clock to half the timer (never lengthening it), so anyone who
+    changed their mind still has time to rejoin. The lot then sells (one franchise left) or goes unsold
+    (none left) through the normal settlement path."""
     if lot.status != "LIVE" or not lot.ends_at or not everyone_is_out(db, room, lot):
         return False
-    target = now_utc() + timedelta(seconds=config.ALL_OUT_SECONDS)
+    target = now_utc() + timedelta(seconds=lot_window(room, lot) * config.ALL_OUT_FRACTION)
     ends = lot.ends_at if lot.ends_at.tzinfo else lot.ends_at.replace(tzinfo=timezone.utc)
     if ends > target:
         lot.ends_at = target
@@ -911,8 +1000,8 @@ def set_out(db: Session, room: Room, franchise: Franchise, lot_id: int, out: boo
             db.delete(existing)
             event(db, room.id, "IN", f"{franchise.name} is back in for {name}.", {"franchise_id": franchise.id, "lot_id": lot.id})
         db.flush()
-        if was_all_out and lot.status == "LIVE" and lot.ends_at and seconds_until(lot.ends_at) < room.timer_seconds / 2:
-            lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds / 2)   # someone is back: give a fair clock
+        if was_all_out and lot.status == "LIVE" and lot.ends_at and seconds_until(lot.ends_at) < lot_window(room, lot) * config.ALL_OUT_FRACTION:
+            lot.ends_at = now_utc() + timedelta(seconds=lot_window(room, lot) * config.ALL_OUT_FRACTION)   # someone is back: give a fair clock
 
 def pool_view(db: Session, room: Room) -> dict:
     players = db.scalars(select(Player).where(Player.room_id == room.id, Player.included == True)
@@ -924,6 +1013,8 @@ def pool_view(db: Session, room: Room) -> dict:
     sold = {}
     for sale in db.scalars(select(Sale).where(Sale.room_id == room.id, Sale.reversed == False).order_by(Sale.id)).all():
         sold[sale.player_id] = sale
+    first_queued = db.scalar(select(Lot.player_id).where(Lot.room_id == room.id, Lot.status == "QUEUED")
+                             .order_by(Lot.round_no, Lot.queue_order).limit(1))
     rows, counts = [], {"SOLD": 0, "UNSOLD": 0, "LIVE": 0, "UPCOMING": 0}
     for p in players:
         row = {"id": p.id, "name": p.name, "role": p.role, "state_team": p.state_team, "base_price": p.base_price}
@@ -936,6 +1027,7 @@ def pool_view(db: Session, room: Room) -> dict:
             row["status"] = "UNSOLD"
         else:
             row["status"] = "UPCOMING"
+        row["next"] = (p.id == first_queued and row["status"] == "UPCOMING")
         counts[row["status"]] += 1
         rows.append(row)
     return {"players": rows, "counts": counts}
