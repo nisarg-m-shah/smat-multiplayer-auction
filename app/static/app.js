@@ -42,7 +42,7 @@ const ICONS={
  PLAY:ICON('<path d="m7 4 13 8-13 8z"/>'),
  INFO:ICON('<circle cx="12" cy="12" r="4"/>')
 };
-const EVENT_ICON={BID:"BID",SOLD:"SOLD",UNSOLD:"UNSOLD",BID_UNDONE:"UNDO",PLAYER_UNDONE:"UNDO",BID_REDONE:"REDO",PLAYER_REDONE:"REDO",PAUSED:"PAUSE",RECOVERED_PAUSED:"PAUSE",RESUMED:"PLAY"};
+const EVENT_ICON={BID:"BID",SOLD:"SOLD",UNSOLD:"UNSOLD",BID_UNDONE:"UNDO",PLAYER_UNDONE:"UNDO",BID_REDONE:"REDO",PLAYER_REDONE:"REDO",PAUSED:"PAUSE",RECOVERED_PAUSED:"PAUSE",RESUMED:"PLAY",OUT:"UNDO",IN:"REDO",ALL_OUT:"PAUSE"};
 function activityHTML(e){
  const k=String(e.kind||"").toLowerCase();
  return `<div class="activity-item ev-${k}">${ICONS[EVENT_ICON[e.kind]||"INFO"]}<span>${esc(e.message)}</span></div>`;
@@ -100,7 +100,7 @@ async function render(s){
  if(state && Number(state.room?.version||0)>Number(s.room?.version||0))return;
  state=s;lastSnapshot=s;bidFieldsVersion=0;noteSnapshotTime(s);
  franchiseOrder=(s.franchises||[]).map(f=>Number(f.id));
- if(isHost){const key=franchiseOrder.join(",")+"|"+(s.room.host_franchise_id||"");if(key!==render._accessKey){render._accessKey=key;if(lastCreds&&!$("invite-output").classList.contains("hidden"))showCredentials(lastCreds);const fl=(s.franchises||[]).filter(f=>Number(f.id)!==Number(s.room.host_franchise_id)).map(f=>({id:f.id,name:f.name}));renderAccess($("invite-list"),fl);renderAccess($("access-live"),fl)}}
+ if(isHost){show("access-panel");const key=franchiseOrder.join(",")+"|"+(s.room.host_franchise_id||"");if(key!==render._accessKey){render._accessKey=key;if(lastCreds&&!$("invite-output").classList.contains("hidden"))showCredentials(lastCreds);if($("access-details").open)loadCredentials()}}
  if(isHost){
   if(s.room.host_franchise_id){const hf=(s.franchises||[]).find(f=>Number(f.id)===Number(s.room.host_franchise_id));if(hf)myFranchise={id:hf.id,name:hf.name};}
   syncHostFranchisePickers(s);
@@ -135,7 +135,7 @@ async function render(s){
  }).join("");
  $("franchises-title").classList.toggle("hidden",!(myFranchise&&others.length));
  $("tab-count-f").textContent=s.franchises.length;
- paintMyTeam(s);
+ paintMyTeam(s);refreshPoolIfNeeded(s);
  $("activity").innerHTML=s.events.map(activityHTML).join("")||'<p class="muted">No activity yet.</p>';
  paintMeChip(s);
  if(s.room.status === "COMPLETED"){
@@ -165,7 +165,7 @@ async function render(s){
   $("player-name").textContent=s.room.status==="ROUND_COMPLETE"?"Round complete":"Waiting for next player";
   paintRole("");$("player-team").textContent="Players remaining: "+s.queue_remaining;$("timer").textContent="—";
   setTimerState("idle");$("timer-fill").style.width="0%";
-  $("base-price").textContent="—";$("current-bid").textContent="—";paintLeader(null);
+  $("base-price").textContent="—";$("current-bid").textContent="—";paintLeader(null);paintOut(null);
   $("next-bid").textContent="—";
   updateBidButton();
  }
@@ -254,11 +254,12 @@ function paintMyTeam(s){
 // ---- Franchises / Activity tabs ---------------------------------------------------------------------
 function selectSideTab(name){
  document.querySelectorAll(".side-tab").forEach(t=>{const on=t.dataset.side===name;t.classList.toggle("active",on);t.setAttribute("aria-selected",on)});
- (name==="franchises"?show:hide)("pane-franchises");(name==="activity"?show:hide)("pane-activity");
+ for(const k of ["franchises","pool","activity"])(name===k?show:hide)("pane-"+k);
+ if(name==="pool")loadAuctionPool();
  try{localStorage.setItem("smat.sideTab",name)}catch(e){}
 }
 document.querySelectorAll(".side-tab").forEach(t=>t.onclick=()=>selectSideTab(t.dataset.side));
-try{const t=localStorage.getItem("smat.sideTab");if(t==="activity"||t==="franchises")selectSideTab(t)}catch(e){}
+try{const t=localStorage.getItem("smat.sideTab");if(t==="activity"||t==="franchises"||t==="pool")selectSideTab(t)}catch(e){}
 
 function paintRole(r){const el=$("player-role");el.textContent=r?roleLabel(r):"Player";el.dataset.role=String(r||"").toUpperCase()}
 function paintMeChip(s){
@@ -408,10 +409,13 @@ function playTimeUp(){              // urgent double buzzer at zero
 function prepareCelebrationAudio(){audioReady()}
 ["pointerdown","keydown","touchstart"].forEach(ev=>document.addEventListener(ev,prepareCelebrationAudio,{passive:true}));
 function playCelebrationSound(sold){
- // sold: rising fanfare with a sparkle on top; unsold: a soft falling sigh
- const notes=sold?[523.25,659.25,783.99,1046.5,1318.5]:[392,329.63,261.63];
- notes.forEach((f,i)=>blip(f,i*(sold?.11:.16),sold?.34:.3,sold?"triangle":"sine",sold?.14:.1));
- if(sold)[1568,2093,2637].forEach((f,i)=>blip(f,.55+i*.09,.18,"sine",.05));
+ if(sold){   // rising fanfare with a sparkle on top
+  [523.25,659.25,783.99,1046.5,1318.5].forEach((f,i)=>blip(f,i*.11,.34,"triangle",.14));
+  [1568,2093,2637].forEach((f,i)=>blip(f,.55+i*.09,.18,"sine",.05));
+ }else{      // unsold: a clear "wah-wah-wah-waaah" sad trombone and a low thud
+  [[392,0],[370,.3],[349,.6],[311,.9]].forEach(([f,t],i)=>blip(f,t,i===3?.9:.26,"sawtooth",.1,i===3?233:f*.97));
+  blip(110,0,.3,"sine",.2,70);
+ }
 }
 function startLocalTimer(endsAt,remainingMs){
  clearInterval(timerInterval);
@@ -454,6 +458,7 @@ function applyIncoming(m){
 function patchBidFields(p,e){
  p.current_bid=e.highest_bid;p.highest_franchise_id=e.leading_franchise_id;
  p.highest_franchise=e.leading_franchise_name;p.next_bid=e.next_bid_amount;p.ends_at=e.timer_deadline;
+ p.out_ids=(p.out_ids||[]).filter(id=>Number(id)!==Number(e.leading_franchise_id));
 }
 // Events normally arrive in order, but the bidder's own HTTP confirmation can overtake the WebSocket
 // event for the previous bid. Hold early events briefly and apply them in order; only a version that
@@ -521,7 +526,7 @@ async function requestResync(reason,attempt=0){
 function paintBid(){
  const p=state?.current_player;if(!p)return;
  $("current-bid").textContent=money(p.current_bid||p.base_price);
- paintLeader(p);
+ paintLeader(p);paintOut(p);
  $("next-bid").textContent=money(p.next_bid);
  // Highlight the leader without rebuilding the franchise cards (keeps expanded squads open).
  document.querySelectorAll("#franchises details[data-franchise]").forEach(el=>
@@ -693,7 +698,7 @@ function showCredentials(d){
  // If the host plays as a franchise, that franchise is the host login: no separate row or password for it.
  const rows=[{franchise:hf?hf.name:d.host_login.franchise,password:d.host_login.password,host:true,label:hf?"HOST":null},...d.credentials.filter(c=>!hf||c.franchise!==hf.name)];
  const box=$("invite-output");
- box.innerHTML=`<div class="section-head"><div><h2>Auction created</h2><p class="muted">Send each person their franchise name, password and the room code. Passwords are shown <b>only now</b>; you can issue a new one any time from Access.</p></div>
+ box.innerHTML=`<div class="section-head"><div><h2>Auction created</h2><p class="muted">Send each person their franchise name, password and the room code. You can look these up again any time in <b>Franchise passwords</b> at the bottom of the page.</p></div>
   <button class="secondary" id="cred-copy-all" type="button">Copy all</button></div>
   <div class="room-code-card"><span class="lbl">Room code</span><strong>${esc(d.room_code)}</strong><span class="muted">${esc(location.origin)}</span></div>
   <div class="cred-list">${rows.map((r,i)=>`<div class="cred-row${r.host?" host":""}"><div class="cred-name">${r.host?'<span class="host-tag">HOST</span>':badgeHTML(r.franchise,i)}<b>${esc(r.franchise)}</b></div><code class="cred-pw">${esc(r.password)}</code><button class="ghost small" type="button" data-copy="${i}">Copy invite</button></div>`).join("")}</div>
@@ -731,20 +736,6 @@ $("login-form").addEventListener("submit",async e=>{
  }catch(err){er.textContent=(err instanceof TypeError)?"No connection. Check your internet and try again.":err.message;er.classList.remove("hidden")}
  finally{btn.disabled=false}
 });
-function renderAccess(el,franchises){
- if(!el)return;
- el.innerHTML=`<h3>Access</h3><p class="muted">People sign in with the room code, their franchise name and a password. Lost or leaked one? Issue a new password; it signs that franchise out on every device.</p>
-  <div class="room-code-line"><span class="lbl">Room code</span><b>${esc(roomCode)}</b></div>
-  <div class="cred-list">${franchises.map(f=>`<div class="cred-row" data-fid="${f.id}"><div class="cred-name">${badgeHTML(f.name,f.id)}<b>${esc(f.name)}</b></div><code class="cred-pw muted">••••-••••</code><button class="ghost small" type="button" data-reset="${f.id}">New password</button></div>`).join("")}</div>`;
- el.querySelectorAll("[data-reset]").forEach(b=>b.onclick=async()=>{
-  const f=franchises.find(x=>x.id==b.dataset.reset);
-  if(!confirm(`Issue a new password for ${f.name}? Anyone signed in as ${f.name} will be signed out.`))return;
-  try{const d=await api(`/api/rooms/${roomCode}/host/reset-password`,{method:"POST",body:JSON.stringify({franchise_id:f.id})});
-   const row=b.closest(".cred-row");row.querySelector(".cred-pw").classList.remove("muted");row.querySelector(".cred-pw").textContent=d.password;
-   b.textContent="Copy invite";b.onclick=()=>copyText(inviteText(roomCode,d.franchise,d.password),b);
-  }catch(err){alert(err.message)}
- });
-}
 
 $("host-more").onclick=()=>{
  const d=$("admin-controls"),open=d.classList.toggle("drawer-closed")===false;
@@ -752,3 +743,106 @@ $("host-more").onclick=()=>{
  try{localStorage.setItem("smat.hostDrawer",open?"1":"0")}catch(e){}
 };
 try{if(localStorage.getItem("smat.hostDrawer")==="1"){$("admin-controls").classList.remove("drawer-closed");$("host-more").setAttribute("aria-expanded","true")}}catch(e){}
+
+// ---- "I'm out": step out of one player, visible to everyone ------------------------------------------
+function paintOut(p){
+ const strip=$("out-strip"),btn=$("out-button");if(!strip||!btn)return;
+ const out=new Set(((p&&p.out_ids)||[]).map(Number)),list=state?.franchises||[];
+ const mine=!!(myFranchise&&out.has(Number(myFranchise.id)));
+ const outList=list.filter(f=>out.has(Number(f.id)));
+ strip.classList.toggle("hidden",!outList.length);
+ $("out-badges").innerHTML=outList.map(f=>`<span class="ob" title="${esc(f.name)} is out">${badgeHTML(f.name,f.id)}</span>`).join("");
+ $("out-count").textContent=outList.length?`${outList.length} of ${list.length} out`:"";
+ const leading=!!(p&&myFranchise&&Number(p.highest_franchise_id)===Number(myFranchise.id));
+ const live=!!p&&state?.room?.status==="LIVE";
+ btn.classList.toggle("is-out",mine);
+ btn.textContent=mine?"Rejoin":"I'm out";
+ btn.disabled=!myFranchise||!live||leading||outInFlight;
+ btn.title=leading?"You are the highest bidder":mine?"Tell everyone you are bidding again":"Tell everyone you are not bidding on this player";
+ document.querySelectorAll("#franchises details[data-franchise]").forEach(el=>el.classList.toggle("is-out",out.has(Number(el.dataset.franchise))));
+ const mt=$("my-squad").querySelector(".team-card");if(mt)mt.classList.toggle("is-out",mine);
+}
+let outInFlight=false;
+$("out-button").onclick=async()=>{
+ const p=state?.current_player;if(!p||!myFranchise||outInFlight)return;
+ const want=!new Set((p.out_ids||[]).map(Number)).has(Number(myFranchise.id));
+ const before=[...(p.out_ids||[])];
+ p.out_ids=want?[...before,Number(myFranchise.id)]:before.filter(i=>Number(i)!==Number(myFranchise.id));
+ outInFlight=true;paintOut(p);
+ try{await api(`/api/rooms/${roomCode}/pass`,{method:"POST",body:JSON.stringify({lot_id:p.lot_id,out:want})})}
+ catch(e){p.out_ids=before;if(!(e instanceof AuthError))message(e.message)}
+ finally{outInFlight=false;paintOut(state?.current_player)}
+};
+
+// ---- auction pool tab ------------------------------------------------------------------------------------
+let poolData=null,poolFilter="UPCOMING",poolKey="",poolLoading=false;
+function sideTabActive(){return document.querySelector(".side-tab.active")?.dataset.side}
+async function loadAuctionPool(force){
+ if(poolLoading||!roomCode||!token)return;
+ poolLoading=true;
+ try{poolData=await api(`/api/rooms/${roomCode}/pool`);renderAuctionPool()}catch(e){}finally{poolLoading=false}
+}
+function renderAuctionPool(){
+ if(!poolData)return;
+ for(const k of ["UPCOMING","SOLD","UNSOLD"])$("pc-"+k).textContent=(poolData.counts[k]||0)+(k==="UPCOMING"?(poolData.counts.LIVE||0):0);
+ document.querySelectorAll(".pf").forEach(b=>b.classList.toggle("active",b.dataset.pool===poolFilter));
+ const q=$("pool-view-search").value.trim().toLowerCase();
+ let rows=poolData.players.filter(p=>poolFilter==="UPCOMING"?(p.status==="UPCOMING"||p.status==="LIVE"):p.status===poolFilter);
+ if(q)rows=rows.filter(p=>`${p.name} ${p.state_team} ${roleLabel(p.role)} ${p.franchise||""}`.toLowerCase().includes(q));
+ const order={BAT:0,AR:1,WK:2,BOWL:3};
+ rows.sort((a,b)=>poolFilter==="SOLD"?b.price-a.price:(a.status==="LIVE"?-1:b.status==="LIVE"?1:0)||(order[a.role]??9)-(order[b.role]??9)||b.base_price-a.base_price||a.name.localeCompare(b.name));
+ $("pool-view-list").innerHTML=rows.length?rows.map(p=>`<div class="pool-row${p.status==="LIVE"?" live":""}">
+   <span class="role-dot" data-role="${esc(String(p.role||"").toUpperCase())}"></span>
+   <div class="pr-name"><b>${esc(p.name)}</b><small>${esc(roleLabel(p.role))}${p.state_team?" · "+esc(p.state_team):""}</small></div>
+   ${p.status==="SOLD"?`<div class="pr-end"><strong>${money(p.price)}</strong><small>${esc(p.franchise||"")}</small></div>`
+    :p.status==="LIVE"?`<span class="chip lead on">On the block</span>`:`<div class="pr-end"><strong>${money(p.base_price)}</strong><small>base</small></div>`}
+  </div>`).join(""):`<p class="muted pool-empty">${q?"No players match your search.":poolFilter==="SOLD"?"Nobody has been sold yet.":poolFilter==="UNSOLD"?"No unsold players so far.":"No players left in the pool."}</p>`;
+}
+document.querySelectorAll(".pf").forEach(b=>b.onclick=()=>{poolFilter=b.dataset.pool;renderAuctionPool()});
+$("pool-view-search").addEventListener("input",renderAuctionPool);
+function refreshPoolIfNeeded(s){
+ const key=`${s.room.status}|${s.current_player?.lot_id||""}|${(s.unsold||[]).length}|${s.franchises.reduce((t,f)=>t+f.squad_count,0)}`;
+ if(key===poolKey)return;poolKey=key;
+ if(sideTabActive()==="pool"||!poolData)loadAuctionPool();
+}
+
+// ---- passwords: bottom of the page, viewable any time ----------------------------------------------------
+let credData=null;
+async function loadCredentials(){
+ try{credData=await api(`/api/rooms/${roomCode}/host/credentials`);renderAccess()}catch(e){}
+}
+function renderAccess(){
+ const el=$("access-live");if(!el)return;
+ if(!credData){el.innerHTML='<p class="muted">Loading…</p>';return}
+ const hid=credData.host_franchise_id,hf=hid&&credData.franchises.find(f=>Number(f.id)===Number(hid));
+ const rows=[{key:"host",label:hf?hf.name:credData.host.franchise,host:true,badgeId:hf?hf.id:0,password:credData.host.password},
+  ...credData.franchises.filter(f=>!hf||f.id!==hf.id).map(f=>({key:String(f.id),id:f.id,label:f.name,badgeId:f.id,password:f.password}))];
+ el.innerHTML=`<p class="muted">Sign in with the room code, the franchise name and its password. Anyone can use their password on any number of devices.</p>
+  <div class="room-code-line"><span class="lbl">Room code</span><b>${esc(roomCode)}</b><button class="ghost small" id="cred-copyall" type="button">Copy all invites</button></div>
+  <div class="cred-list">${rows.map(r=>`<div class="cred-row${r.host?" host":""}" data-key="${r.key}">
+   <div class="cred-name">${r.host?'<span class="host-tag">HOST</span>':badgeHTML(r.label,r.badgeId)}<b>${esc(r.label)}</b></div>
+   <code class="cred-pw" data-shown="0">${r.password?"••••-••••":"Not viewable"}</code>
+   <div class="cred-actions">${r.password?`<button class="ghost small" type="button" data-act="show">Show</button><button class="ghost small" type="button" data-act="copy">Copy invite</button>`:""}
+   <button class="ghost small" type="button" data-act="reset">${r.password?"New password":"Issue password"}</button></div>
+  </div>`).join("")}</div>`;
+ const byKey=Object.fromEntries(rows.map(r=>[r.key,r]));
+ el.querySelectorAll(".cred-row").forEach(row=>{
+  const r=byKey[row.dataset.key],pw=row.querySelector(".cred-pw");
+  row.querySelectorAll("[data-act]").forEach(b=>b.onclick=async()=>{
+   const act=b.dataset.act;
+   if(act==="show"){const on=pw.dataset.shown!=="1";pw.dataset.shown=on?"1":"0";pw.textContent=on?r.password:"••••-••••";b.textContent=on?"Hide":"Show"}
+   else if(act==="copy")copyText(inviteText(roomCode,r.label,r.password),b);
+   else if(act==="reset"){
+    const who=r.host?"the host login":r.label;
+    if(!confirm(`Issue a new password for ${who}? Anyone signed in with it will be signed out.`))return;
+    try{
+     const d=await api(`/api/rooms/${roomCode}/host/reset-password`,{method:"POST",body:JSON.stringify({franchise_id:r.host?null:r.id})});
+     if(r.host){const rs=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({room:roomCode,franchise:"Host",password:d.password})});const j=await rs.json();token=j.token;saveSession();location.reload();return}
+     await loadCredentials();
+    }catch(err){alert(err.message)}
+   }
+  });
+ });
+ $("cred-copyall").onclick=e=>copyText(rows.filter(r=>r.password).map(r=>inviteText(roomCode,r.label,r.password)).join("\n\n"),e.target);
+}
+$("access-details").addEventListener("toggle",()=>{if($("access-details").open)loadCredentials()});

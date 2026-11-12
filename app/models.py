@@ -100,3 +100,13 @@ class Event(Base):
     message: Mapped[str] = mapped_column(Text)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+class LotPass(Base):
+    """A franchise declaring itself out of the bidding for one lot (visible to everyone)."""
+    __tablename__ = "lot_passes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_id: Mapped[int] = mapped_column(ForeignKey("rooms.id"), index=True)
+    lot_id: Mapped[int] = mapped_column(ForeignKey("lots.id"), index=True)
+    franchise_id: Mapped[int] = mapped_column(ForeignKey("franchises.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("lot_id", "franchise_id"),)

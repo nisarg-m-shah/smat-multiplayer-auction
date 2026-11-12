@@ -25,3 +25,6 @@ RESULT_HOLD_UNSOLD = float(os.getenv("RESULT_HOLD_UNSOLD", "3.5"))
 # and a press at 0.3s left). The player is sold only after the grace (plus a small processing slack) has passed.
 BID_GRACE_SECONDS = float(os.getenv("BID_GRACE_SECONDS", "0.8"))
 SETTLE_SLACK_SECONDS = float(os.getenv("SETTLE_SLACK_SECONDS", "0.25")) if BID_GRACE_SECONDS > 0 else 0.0
+
+# When every franchise that can still bid has declared itself out, the lot is closed after this many seconds.
+ALL_OUT_SECONDS = float(os.getenv("ALL_OUT_SECONDS", "1.5"))

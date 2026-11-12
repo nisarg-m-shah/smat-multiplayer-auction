@@ -11,10 +11,10 @@ from . import perf, config
 from .db import Base, engine, SessionLocal, get_db
 from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
 from .security import (new_token, token_hash, new_nonce, derive_token, new_password,
-                       hash_password, check_password)
+                       hash_password, check_password, derive_password)
 from .config import AUCTION_SOURCE, DEFAULT_PURSE, DEFAULT_BASE_PRICE, MAX_SQUAD, MIN_SQUAD
 from .seed import load_players, load_players_csv
-from .engine import (get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
+from .engine import (set_out, pool_view, close_if_everyone_out, get_room, get_franchise_by_token, create_queue, open_next_lot, seconds_until,
                      place_bid, settle_lot, pause_room, resume_room, undo_last_sale,
                      undo_last_bid, redo_last_bid, redo_last_sale, nominated_unsold, snapshot, event, now_utc,
                      recover_interrupted_rooms, lock_for,
@@ -458,7 +458,7 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
     code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
     if any(n.lower() == HOST_LOGIN_NAME.lower() for n in names):
         raise HTTPException(400, f'"{HOST_LOGIN_NAME}" is reserved for the host login. Pick another franchise name.')
-    host_nonce, host_password = new_nonce(), new_password()
+    host_nonce = new_nonce(); host_password = derive_password("host", host_nonce)
     host_token = derive_token("host", host_nonce)
     room = Room(code=code, name=payload.name, host_token_hash=token_hash(host_token),
                 host_nonce=host_nonce, host_password_hash=hash_password(host_password),
@@ -469,7 +469,7 @@ def create_room(payload: CreateRoom, db: Session = Depends(get_db)):
     db.flush()
     invite_links, credentials = [], []
     for i, name in enumerate(names):
-        nonce, password = new_nonce(), new_password()
+        nonce = new_nonce(); password = derive_password("franchise", nonce)
         token = derive_token("franchise", nonce)
         f = Franchise(room_id=room.id, name=name, invite_hash=token_hash(token),
                       purse_remaining=payload.purse, created_order=i,
@@ -579,9 +579,9 @@ def reset_password(code: str, payload: ResetPassword, authorization: str | None 
     """Host-only. Issues a fresh password. Existing sessions for that login are signed out, which is the
     point of a reset (a leaked or forgotten password)."""
     room = require_host(db, code, authorization)
-    password = new_password()
     nonce = new_nonce()
     if payload.franchise_id is None:
+        password = derive_password("host", nonce)
         room.host_nonce, room.host_password_hash = nonce, hash_password(password)
         room.host_token_hash = token_hash(derive_token("host", nonce))
         who = HOST_LOGIN_NAME
@@ -589,11 +589,65 @@ def reset_password(code: str, payload: ResetPassword, authorization: str | None 
         f = db.get(Franchise, payload.franchise_id)
         if f is None or f.room_id != room.id:
             raise HTTPException(404, "Franchise not found")
+        password = derive_password("franchise", nonce)
         f.login_nonce, f.password_hash = nonce, hash_password(password)
         f.invite_hash = token_hash(derive_token("franchise", nonce))
         who = f.name
     db.commit()
     return {"franchise": who, "password": password}
+
+@app.get("/api/rooms/{code}/host/credentials")
+def host_credentials(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    """Host-only: every login again, any time. Passwords of rooms created before this feature were never
+    recoverable (only their hash exists), so those come back as null and need a reset."""
+    room = require_host(db, code, authorization)
+    def recover(kind, nonce, stored):
+        if not nonce:
+            return None
+        pw = derive_password(kind, nonce)
+        return pw if check_password(pw, stored) else None
+    franchises = db.scalars(select(Franchise).where(Franchise.room_id == room.id).order_by(Franchise.created_order)).all()
+    return {"room_code": room.code,
+            "host": {"franchise": HOST_LOGIN_NAME, "password": recover("host", room.host_nonce, room.host_password_hash)},
+            "host_franchise_id": room.host_franchise_id,
+            "franchises": [{"id": f.id, "name": f.name,
+                            "password": recover("franchise", f.login_nonce, f.password_hash)} for f in franchises]}
+
+@app.get("/api/rooms/{code}/pool")
+def pool(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    room, _f, _h = auth_context(db, code, authorization)
+    return pool_view(db, room)
+
+class PassRequest(BaseModel):
+    lot_id: int
+    out: bool = True
+
+def _process_pass(code: str, authorization: str | None, req: PassRequest):
+    with SessionLocal() as db:
+        room, franchise, is_host = auth_context(db, code, authorization)
+        if is_host:
+            if room.host_franchise_id is None:
+                raise HTTPException(403, "Pick a franchise to bid as before stepping out of a player")
+            franchise = db.get(Franchise, room.host_franchise_id)
+        with lock_for(room.code):
+            db.refresh(room)
+            try:
+                set_out(db, room, franchise, req.lot_id, req.out)
+                room.version += 1
+                db.commit()
+            except ValueError as e:
+                db.rollback()
+                raise HTTPException(status_code=409, detail=str(e))
+            snap = snapshot(db, room)
+            publish(room.code, {"type": "snapshot", "data": snap})
+            return snap
+
+@app.post("/api/rooms/{code}/pass")
+async def pass_player(code: str, payload: PassRequest, authorization: str | None = Header(default=None)):
+    _ensure_loop()
+    result = await asyncio.to_thread(_process_pass, code, authorization, payload)
+    arm_timer(code)
+    return {"ok": True, "out_ids": (result.get("current_player") or {}).get("out_ids", [])}
 
 @app.get("/api/rooms/{code}/me")
 def get_me(code: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
@@ -837,6 +891,9 @@ def _apply_host_action(db, room, action):
         pause_room(db, room)
     elif action == "resume":
         resume_room(db, room)
+        lot = db.get(Lot, room.current_lot_id) if room.current_lot_id else None
+        if lot is not None:
+            close_if_everyone_out(db, room, lot)     # everyone had already stepped out before the pause
     elif action == "advance":
         if room.status == "LIVE":
             lot = db.get(Lot, room.current_lot_id)

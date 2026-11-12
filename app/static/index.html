@@ -83,7 +83,6 @@
           <button id="start-auction" class="primary">Lock pool &amp; start</button>
         </div>
         <div class="host-franchise-picker"><label>My franchise (host participation)<select id="host-franchise-setup"><option value="">Host only — not bidding</option></select></label><p class="muted">Choose the franchise you will manage and bid for. This choice locks when the auction starts.</p></div>
-        <div id="invite-list" class="access-block"></div>
         <div class="toolbar"><input id="pool-search" placeholder="Search player, state team or role"><label class="upload">Import CSV<input id="csv-upload" type="file" accept=".csv"></label></div>
         <div id="pool-table" class="table-wrap"></div>
         <details class="add-player"><summary>Add a player manually</summary><form id="add-player" class="inline-form"><input name="name" placeholder="Player name" required><input name="state_team" placeholder="State team"><select name="role"><option>BAT</option><option>AR</option><option>BOWL</option><option>WK</option><option>UNKNOWN</option></select><input name="base_price" type="number" value="20"><input name="importance_weight" type="number" min="0.01" step="0.1" value="1"><button class="secondary">Add</button></form></details>
@@ -114,9 +113,6 @@
           <details class="tool"><summary>Unsold-only round</summary>
             <div class="nomination"><p class="muted" id="unsold-warning">Select unsold players to bring back. Starting this round skips all remaining unseen players.</p><div id="unsold-list"></div><button id="nominate" class="secondary">Skip remaining players &amp; start unsold-only round</button></div>
           </details>
-          <details class="tool"><summary>Access &amp; passwords</summary>
-            <div id="access-live" class="access-block"></div>
-          </details>
         </section>
 
         <section class="auction-grid">
@@ -144,8 +140,10 @@
                 <span class="leader-text"><small id="leader-label">Highest bidder</small><b id="leader-name">No bids yet</b></span>
                 <span id="leader-you" class="chip you hidden">You</span>
               </div>
+              <div id="out-strip" class="out-strip hidden" aria-live="polite"><span class="out-label">Out</span><span id="out-badges" class="out-badges"></span><span id="out-count" class="out-count"></span></div>
               <div class="bid-dock" id="bid-dock">
                 <button id="bid-button" class="primary bid-button"><span class="bid-label" id="bid-label">Place bid</span><span class="bid-amt"><span id="next-bid">—</span></span></button>
+                <button id="out-button" class="out-btn" type="button" title="Tell everyone you are not bidding on this player">I'm out</button>
               </div>
               <p id="bid-feedback" class="feedback"></p>
             </div>
@@ -155,12 +153,22 @@
           <div class="panel side-panel" id="side-panel">
             <div class="side-tabs" role="tablist" aria-label="Auction details">
               <button class="side-tab active" type="button" role="tab" data-side="franchises" aria-selected="true">Franchises <span class="count" id="tab-count-f"></span></button>
+              <button class="side-tab" type="button" role="tab" data-side="pool" aria-selected="false">Pool</button>
               <button class="side-tab" type="button" role="tab" data-side="activity" aria-selected="false">Activity</button>
             </div>
             <div id="pane-franchises" class="side-pane" role="tabpanel">
               <div id="my-squad"></div>
               <div id="franchises-title" class="subhead hidden">Other franchises</div>
               <div id="franchises" class="franchise-grid"></div>
+            </div>
+            <div id="pane-pool" class="side-pane hidden" role="tabpanel">
+              <div class="pool-filters" role="group" aria-label="Pool filter">
+                <button type="button" class="pf active" data-pool="UPCOMING">Upcoming <b id="pc-UPCOMING">0</b></button>
+                <button type="button" class="pf" data-pool="SOLD">Sold <b id="pc-SOLD">0</b></button>
+                <button type="button" class="pf" data-pool="UNSOLD">Unsold <b id="pc-UNSOLD">0</b></button>
+              </div>
+              <input id="pool-view-search" class="pool-search" type="search" placeholder="Search player, team or role" autocomplete="off">
+              <div id="pool-view-list" class="pool-list"><p class="muted">Loading the pool…</p></div>
             </div>
             <div id="pane-activity" class="side-pane hidden" role="tabpanel">
               <div id="activity" class="activity"></div>
@@ -174,6 +182,14 @@
         <div class="final-hero panel"><div class="eyebrow">SMAT AUCTION</div><h2>Auction completed</h2><p class="muted">The auction has officially ended. Here is the final franchise-wise squad breakdown.</p></div>
         <div id="final-summary" class="final-summary-grid"></div>
         <div id="final-franchises" class="final-franchise-grid"></div>
+      </section>
+
+      <!-- host only: logins can be looked up again any time. Kept at the very bottom of the page. -->
+      <section id="access-panel" class="panel hidden">
+        <details id="access-details" class="tool plain">
+          <summary>Franchise passwords <span class="muted">(host only)</span></summary>
+          <div id="access-live" class="access-block"></div>
+        </details>
       </section>
     </section>
   </main>

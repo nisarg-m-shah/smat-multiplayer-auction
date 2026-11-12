@@ -6,7 +6,7 @@ from sqlalchemy import select, desc, func, exists, and_, or_, update, insert, li
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.orm.attributes import set_committed_value
 from . import config
-from .models import Room, Franchise, Player, Lot, Bid, Sale, Event
+from .models import LotPass, Room, Franchise, Player, Lot, Bid, Sale, Event
 from .seed import weighted_random_order
 
 # One-process lock is a useful guard for this 10-person application.
@@ -537,6 +537,8 @@ def undo_last_sale(db: Session, room: Room):
         room.status = "LIVE"
     lot.settlement_redo_available = True
     room.current_lot_id = lot.id
+    for stale in db.scalars(select(LotPass).where(LotPass.lot_id == lot.id)).all():
+        db.delete(stale)               # a restored player starts with a clean slate of "I'm out" flags
 
     msg = f"Undo last player: {player.name} is back on the block"
     msg += f" at {sale.price} (last bid by {franchise.name})." if sale else " (previously unsold)."
@@ -801,7 +803,8 @@ def snapshot(db: Session, room: Room):
             "highest_franchise": next((f.name for f in franchises if f.id == live.highest_franchise_id), None),
             "ends_at": iso_utc(live.ends_at), "remaining_ms": live.remaining_ms,
             "status": live.status, "round_no": live.round_no,
-            "next_bid": next_bid_amount(live)
+            "next_bid": next_bid_amount(live),
+            "out_ids": sorted(out_ids_for_lot(db, live)) if live.status in ("LIVE", "PAUSED") else []
         }
     latest_lot_by_player = {}
     for candidate in sorted(lots, key=lambda item: item.id, reverse=True):
@@ -838,3 +841,101 @@ def snapshot(db: Session, room: Room):
             "can_redo_sale": bool(room.status != "COMPLETED" and redoable_sale)
         }
     }
+
+
+# ---- out of bidding ("I'm out") ----------------------------------------------------------------
+def out_ids_for_lot(db: Session, lot: Lot) -> set[int]:
+    """Franchises currently out for this lot. A pass is void once that franchise bids again, so this is
+    computed lazily and the bid hot path never has to touch it."""
+    passes = db.scalars(select(LotPass).where(LotPass.lot_id == lot.id)).all()
+    if not passes:
+        return set()
+    last_bid = {}
+    for b in db.scalars(select(Bid).where(Bid.lot_id == lot.id, Bid.franchise_id.in_([p.franchise_id for p in passes]),
+                                          Bid.active == True)).all():
+        t = b.accepted_at if b.accepted_at.tzinfo else b.accepted_at.replace(tzinfo=timezone.utc)
+        if b.franchise_id not in last_bid or t > last_bid[b.franchise_id]:
+            last_bid[b.franchise_id] = t
+    out = set()
+    for p in passes:
+        created = p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc)
+        if last_bid.get(p.franchise_id, created) > created:
+            continue
+        if p.franchise_id != lot.highest_franchise_id:
+            out.add(p.franchise_id)
+    return out
+
+def cannot_bid_ids(db: Session, room: Room, lot: Lot) -> set[int]:
+    """Franchises that could not place the next bid anyway (purse too low or squad full)."""
+    need = next_bid_amount(lot)
+    counts = dict(db.execute(select(Sale.franchise_id, func.count()).where(
+        Sale.room_id == room.id, Sale.reversed == False).group_by(Sale.franchise_id)).all())
+    franchises = db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()
+    return {f.id for f in franchises if f.purse_remaining < need or counts.get(f.id, 0) >= room.max_squad}
+
+def everyone_is_out(db: Session, room: Room, lot: Lot) -> bool:
+    franchises = {f.id for f in db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()}
+    active = franchises - cannot_bid_ids(db, room, lot) - out_ids_for_lot(db, lot)
+    leader = lot.highest_franchise_id
+    return not (active - ({leader} if leader else set()))
+
+def close_if_everyone_out(db: Session, room: Room, lot: Lot) -> bool:
+    """Shorten the clock to a moment when nobody is left to bid: the lot then sells (one franchise left)
+    or goes unsold (none left) through the normal settlement path."""
+    if lot.status != "LIVE" or not lot.ends_at or not everyone_is_out(db, room, lot):
+        return False
+    target = now_utc() + timedelta(seconds=config.ALL_OUT_SECONDS)
+    ends = lot.ends_at if lot.ends_at.tzinfo else lot.ends_at.replace(tzinfo=timezone.utc)
+    if ends > target:
+        lot.ends_at = target
+        event(db, room.id, "ALL_OUT", "Everyone still in the bidding has stepped out. Closing the player.", {"lot_id": lot.id})
+    return True
+
+def set_out(db: Session, room: Room, franchise: Franchise, lot_id: int, out: bool):
+    lot = current_lot(db, room)
+    if not lot or lot.id != lot_id or lot.status not in ("LIVE", "PAUSED") or room.status not in ("LIVE", "PAUSED"):
+        raise ValueError("That player is no longer on the block")
+    existing = db.scalars(select(LotPass).where(LotPass.lot_id == lot.id, LotPass.franchise_id == franchise.id)).first()
+    name = db.get(Player, lot.player_id).name
+    was_all_out = everyone_is_out(db, room, lot)
+    if out:
+        if lot.highest_franchise_id == franchise.id:
+            raise ValueError("You are the highest bidder, so you cannot step out of this player")
+        if existing is None:
+            db.add(LotPass(room_id=room.id, lot_id=lot.id, franchise_id=franchise.id))
+            event(db, room.id, "OUT", f"{franchise.name} is out for {name}.", {"franchise_id": franchise.id, "lot_id": lot.id})
+        db.flush()
+        close_if_everyone_out(db, room, lot)
+    else:
+        if existing is not None:
+            db.delete(existing)
+            event(db, room.id, "IN", f"{franchise.name} is back in for {name}.", {"franchise_id": franchise.id, "lot_id": lot.id})
+        db.flush()
+        if was_all_out and lot.status == "LIVE" and lot.ends_at and seconds_until(lot.ends_at) < room.timer_seconds / 2:
+            lot.ends_at = now_utc() + timedelta(seconds=room.timer_seconds / 2)   # someone is back: give a fair clock
+
+def pool_view(db: Session, room: Room) -> dict:
+    players = db.scalars(select(Player).where(Player.room_id == room.id, Player.included == True)
+                         .order_by(Player.source_order)).all()
+    names = {f.id: f.name for f in db.scalars(select(Franchise).where(Franchise.room_id == room.id)).all()}
+    latest = {}
+    for lot in db.scalars(select(Lot).where(Lot.room_id == room.id).order_by(Lot.id)).all():
+        latest[lot.player_id] = lot
+    sold = {}
+    for sale in db.scalars(select(Sale).where(Sale.room_id == room.id, Sale.reversed == False).order_by(Sale.id)).all():
+        sold[sale.player_id] = sale
+    rows, counts = [], {"SOLD": 0, "UNSOLD": 0, "LIVE": 0, "UPCOMING": 0}
+    for p in players:
+        row = {"id": p.id, "name": p.name, "role": p.role, "state_team": p.state_team, "base_price": p.base_price}
+        lot, sale = latest.get(p.id), sold.get(p.id)
+        if sale is not None:
+            row.update(status="SOLD", price=sale.price, franchise=names.get(sale.franchise_id), franchise_id=sale.franchise_id)
+        elif lot is not None and lot.status in ("LIVE", "PAUSED"):
+            row["status"] = "LIVE"
+        elif lot is not None and lot.status == "UNSOLD":
+            row["status"] = "UNSOLD"
+        else:
+            row["status"] = "UPCOMING"
+        counts[row["status"]] += 1
+        rows.append(row)
+    return {"players": rows, "counts": counts}

@@ -44,3 +44,11 @@ def check_password(password: str, stored: str | None) -> bool:
     salt, want = stored.split("$", 1)
     dk = hashlib.pbkdf2_hmac("sha256", _norm_pw(password).encode(), salt.encode(), _PBKDF2_ROUNDS)
     return hmac.compare_digest(dk.hex(), want)
+
+
+def derive_password(kind: str, nonce: str) -> str:
+    """Passwords are derived from the per-record nonce (like the tokens), so the host can look them up
+    again later without a plaintext copy ever being stored. Resetting rotates the nonce."""
+    mac = hmac.new(APP_SECRET.encode("utf-8"), f"pw:{kind}:{nonce}".encode("utf-8"), hashlib.sha256).digest()
+    raw = "".join(_PW_ALPHABET[b % len(_PW_ALPHABET)] for b in mac[:8])
+    return raw[:4] + "-" + raw[4:]
